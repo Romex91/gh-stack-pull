@@ -39,7 +39,19 @@ Requires: gh with the gh-stack extension, git, jq.
 USAGE
 }
 
-die() { echo "gh stack-pull: $*" >&2; exit 1; }
+# Colours: only on a terminal, and never when NO_COLOR is set (https://no-color.org).
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_GREEN=$'\e[32m'; C_YELLOW=$'\e[33m'; C_CYAN=$'\e[36m'; C_BOLD=$'\e[1m'; C_DIM=$'\e[2m'; C_RESET=$'\e[0m'
+else
+  C_GREEN=; C_YELLOW=; C_CYAN=; C_BOLD=; C_DIM=; C_RESET=
+fi
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  E_RED=$'\e[31m'; E_YELLOW=$'\e[33m'; E_BOLD=$'\e[1m'; E_RESET=$'\e[0m'
+else
+  E_RED=; E_YELLOW=; E_BOLD=; E_RESET=
+fi
+
+die() { echo "${E_RED}gh stack-pull: $*${E_RESET}" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -71,38 +83,38 @@ current=$(git branch --show-current || true)
 mapfile -t branches < <(jq -r '.branches[] | select(.isMerged | not) | .name' <<<"$view")
 branches=("$trunk" "${branches[@]}")
 
-echo "Fetching $REMOTE..."
+echo "${C_DIM}Fetching $REMOTE...${C_RESET}"
 git fetch --quiet --prune "$REMOTE"
 
 ff=()        # branches to fast-forward
 diverged=()  # branches whose local and remote tips have both moved
 for b in "${branches[@]}"; do
-  local_sha=$(git rev-parse --verify --quiet "refs/heads/$b") || { echo "  $b: no local branch, skipped"; continue; }
-  remote_sha=$(git rev-parse --verify --quiet "refs/remotes/$REMOTE/$b") || { echo "  $b: not on $REMOTE, skipped"; continue; }
+  local_sha=$(git rev-parse --verify --quiet "refs/heads/$b") || { echo "  ${C_DIM}$b: no local branch, skipped${C_RESET}"; continue; }
+  remote_sha=$(git rev-parse --verify --quiet "refs/remotes/$REMOTE/$b") || { echo "  ${C_DIM}$b: not on $REMOTE, skipped${C_RESET}"; continue; }
   if [ "$local_sha" = "$remote_sha" ]; then
-    echo "  $b: up to date"
+    echo "  ${C_DIM}$b: up to date${C_RESET}"
   elif git merge-base --is-ancestor "$local_sha" "$remote_sha"; then
-    echo "  $b: behind by $(git rev-list --count "$local_sha..$remote_sha"), fast-forward"
+    echo "  ${C_BOLD}$b${C_RESET}: ${C_GREEN}behind by $(git rev-list --count "$local_sha..$remote_sha"), fast-forward${C_RESET}"
     ff+=("$b")
   elif git merge-base --is-ancestor "$remote_sha" "$local_sha"; then
-    echo "  $b: ahead by $(git rev-list --count "$remote_sha..$local_sha"), nothing to pull"
+    echo "  ${C_BOLD}$b${C_RESET}: ${C_CYAN}ahead by $(git rev-list --count "$remote_sha..$local_sha"), nothing to pull${C_RESET}"
   else
-    echo "  $b: diverged (local +$(git rev-list --count "$remote_sha..$local_sha"), $REMOTE +$(git rev-list --count "$local_sha..$remote_sha"))"
+    echo "  ${C_BOLD}$b${C_RESET}: ${C_YELLOW}diverged (local +$(git rev-list --count "$remote_sha..$local_sha"), $REMOTE +$(git rev-list --count "$local_sha..$remote_sha"))${C_RESET}"
     diverged+=("$b")
   fi
 done
 
 if [ ${#diverged[@]} -gt 0 ] && [ $REBASE -eq 0 ]; then
   echo >&2
-  echo "fatal: ${#diverged[@]} branch(es) have diverged from $REMOTE and cannot be fast-forwarded:" >&2
+  echo "${E_RED}${E_BOLD}fatal:${E_RESET}${E_RED} ${#diverged[@]} branch(es) have diverged from $REMOTE and cannot be fast-forwarded:${E_RESET}" >&2
   printf '  %s\n' "${diverged[@]}" >&2
-  echo "hint: rerun with --rebase to replay the local commits on top of $REMOTE:" >&2
-  echo "hint:   gh stack-pull --rebase" >&2
+  echo "${E_YELLOW}hint: rerun with --rebase to replay the local commits on top of $REMOTE:${E_RESET}" >&2
+  echo "${E_YELLOW}hint:   ${E_BOLD}gh stack-pull --rebase${E_RESET}" >&2
   exit 1
 fi
 
 if [ ${#ff[@]} -eq 0 ] && [ ${#diverged[@]} -eq 0 ]; then
-  echo "Already up to date."
+  echo "${C_GREEN}Already up to date.${C_RESET}"
   exit 0
 fi
 
@@ -113,7 +125,7 @@ for b in "${ff[@]}"; do
     # A fetch from the repository itself is git's fast-forward-only ref update.
     git fetch --quiet . "refs/remotes/$REMOTE/$b:refs/heads/$b"
   fi
-  echo "Fast-forwarded $b to $(git rev-parse --short "refs/heads/$b")"
+  echo "${C_GREEN}Fast-forwarded${C_RESET} ${C_BOLD}$b${C_RESET} to $(git rev-parse --short "refs/heads/$b")"
 done
 
 for b in "${diverged[@]}"; do
@@ -123,12 +135,12 @@ for b in "${diverged[@]}"; do
   # branch that was merely rewritten upstream needs no replay at all.
   if git rebase --quiet --fork-point --empty=drop "refs/remotes/$REMOTE/$b" "$b" >/dev/null 2>&1; then
     kept=$(git rev-list --count "refs/remotes/$REMOTE/$b..refs/heads/$b")
-    echo "Rebased $b onto $REMOTE ($before -> $(git rev-parse --short "refs/heads/$b"), $kept local commit(s) kept)"
+    echo "${C_GREEN}Rebased${C_RESET} ${C_BOLD}$b${C_RESET} onto $REMOTE ($before -> $(git rev-parse --short "refs/heads/$b"), ${C_CYAN}$kept local commit(s) kept${C_RESET})"
   else
     echo >&2
-    echo "CONFLICT: rebasing $b onto $REMOTE/$b stopped." >&2
-    echo "Resolve the conflicts, then 'git rebase --continue' (or 'git rebase --abort')," >&2
-    echo "then rerun 'gh stack-pull --rebase' for the remaining branches." >&2
+    echo "${E_RED}${E_BOLD}CONFLICT:${E_RESET}${E_RED} rebasing $b onto $REMOTE/$b stopped.${E_RESET}" >&2
+    echo "${E_YELLOW}Resolve the conflicts, then ${E_BOLD}git rebase --continue${E_RESET}${E_YELLOW} (or ${E_BOLD}git rebase --abort${E_RESET}${E_YELLOW}),${E_RESET}" >&2
+    echo "${E_YELLOW}then rerun ${E_BOLD}gh stack-pull --rebase${E_RESET}${E_YELLOW} for the remaining branches.${E_RESET}" >&2
     exit 1
   fi
 done
@@ -136,4 +148,4 @@ done
 if [ -n "$current" ] && [ "$(git branch --show-current || true)" != "$current" ]; then
   git switch --quiet "$current"
 fi
-echo "Done."
+echo "${C_GREEN}${C_BOLD}Done.${C_RESET}"
