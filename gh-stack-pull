@@ -101,7 +101,8 @@ state_file=$git_dir/gh-stack-pull
 # patch is on the remote branch; if nothing is left, "noop" makes the branch
 # the remote branch. Deleting every line would abort the rebase instead.
 # "p" is the pick command under rebase.abbreviateCommands, which the rebase
-# turns off anyway.
+# turns off anyway, as it does rebase.autosquash, which would turn a wanted
+# fixup commit into a "fixup" line and lose it here.
 todo_filter=$git_dir/gh-stack-pull-todo-filter
 cat > "$todo_filter" <<'FILTER'
 #!/usr/bin/env bash
@@ -156,8 +157,10 @@ rebase_branch() {
   # git compares diffs with context, so a commit whose neighbours were
   # rewritten upstream is replayed and conflicts.
   if [ -n "${replay_all[$b]:-}" ]; then
-    err=$(WANTED=${wanted[$b]} GIT_SEQUENCE_EDITOR=$todo_filter \
-      git -c core.abbrev=no -c rebase.abbreviateCommands=false rebase --interactive --quiet --empty=drop --onto "refs/remotes/$REMOTE/$b" "$(git merge-base "refs/remotes/$REMOTE/$b" "$b")" "$b" 2>&1 >/dev/null) && ok=1 || ok=0
+    # Git starts the editor through the shell, so the path is quoted for it.
+    err=$(WANTED=${wanted[$b]} GIT_SEQUENCE_EDITOR="'${todo_filter//\'/\'\\\'\'}'" \
+      git -c core.abbrev=no -c rebase.abbreviateCommands=false -c rebase.autosquash=false \
+      rebase --interactive --quiet --empty=drop --onto "refs/remotes/$REMOTE/$b" "$(git merge-base "refs/remotes/$REMOTE/$b" "$b")" "$b" 2>&1 >/dev/null) && ok=1 || ok=0
   else
     err=$(git rebase --quiet --empty=drop --fork-point "refs/remotes/$REMOTE/$b" "$b" 2>&1 >/dev/null) && ok=1 || ok=0
   fi

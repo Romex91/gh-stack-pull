@@ -395,6 +395,69 @@ test_replay_works_from_subdirectory() {
   ! rebasing "$A"
 }
 
+test_replay_preserves_fixup_with_autosquash_enabled() {
+  fixture
+  add_file_on "$A" s3 tooltip.txt "add tooltip"
+  (cd "$A" && git push -q origin s3)
+  local tooltip; tooltip=$(sha "$A" s3)
+
+  # Unpushed fixup to the commit that B will overwrite.
+  (
+    cd "$A"
+    git switch -q s3
+    echo "improved tooltip" > tooltip.txt
+    git add tooltip.txt
+    git commit -q --fixup="$tooltip"
+  )
+
+  # B never fetched the tooltip; a commit on s2 too, so the cascade force-pushes s3.
+  commit_on "$B" s2 21 "B on s2" "B s2"; add_file_on "$B" s3 remote.txt "remote work"; sync_on "$B"
+  git -C "$A" fetch -q origin
+  assert_eq "$(git -C "$A" branch -r --contains "$tooltip" | wc -l)" 0 "tooltip overwritten remotely"
+
+  cd "$A"
+  git config --local rebase.autosquash true
+  git config --local rebase.abbreviateCommands false
+  pull --rebase; assert_status 0
+
+  # Success alone is insufficient: the buggy filter silently drops the fixup.
+  assert_eq "$(git show s3:tooltip.txt)" "improved tooltip" "unpushed fixup preserved"
+  assert_eq "$(git show s3:remote.txt)" "remote.txt" "remote work preserved"
+  git merge-base --is-ancestor origin/s3 s3
+  on_branch "$A" s3
+  ! rebasing "$A"
+}
+
+test_replay_works_with_spaces_in_repository_path() {
+  fixture
+
+  # Move the clone so the sequence editor's absolute path contains spaces.
+  cd "$WORK"
+  mv "$A" "$WORK/clone with spaces"
+  A="$WORK/clone with spaces"
+
+  add_file_on "$A" s3 tooltip.txt "add tooltip"
+  (cd "$A" && git push -q origin s3)
+  local tooltip; tooltip=$(sha "$A" s3)
+
+  # B never fetched the tooltip; a commit on s2 too, so the cascade force-pushes s3.
+  commit_on "$B" s2 21 "B on s2" "B s2"; add_file_on "$B" s3 remote.txt "remote work"; sync_on "$B"
+  git -C "$A" fetch -q origin
+  assert_eq "$(git -C "$A" branch -r --contains "$tooltip" | wc -l)" 0 "tooltip overwritten remotely"
+
+  cd "$A"
+  git config --local rebase.autosquash false
+  git config --local rebase.abbreviateCommands false
+  pull --rebase; assert_status 0
+
+  assert_eq "$(git log --format=%s origin/s3..s3)" "add tooltip" "only the tooltip replayed"
+  assert_eq "$(git show s3:tooltip.txt)" "tooltip.txt" "lost tooltip recovered"
+  assert_eq "$(git show s3:remote.txt)" "remote.txt" "remote work preserved"
+  git merge-base --is-ancestor origin/s3 s3
+  on_branch "$A" s3
+  ! rebasing "$A"
+}
+
 test_refuses_dirty_tree() {
   fixture; cd "$A"; echo dirty >> file.txt
   pull; assert_status 1; assert_contains "uncommitted changes"
