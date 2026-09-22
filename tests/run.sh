@@ -201,11 +201,11 @@ test_lost_commit_on_parent_and_child_is_kept_on_both() {
   cd "$A"; pull --rebase; assert_status 0
   assert_eq "$(grep -c "will be kept: ${y:0:7} Y from A" <<<"$out")" 1 "Y reported once, on the lowest branch"
   assert_contains "Kept 1 commit(s)"
-  assert_eq "$(git log --format=%s origin/s2..s2)" "Y from A" "Y replayed on s2"
-  assert_eq "$(git log --format=%s origin/s3..s3)" "Y from A" "Y replayed on s3 too, not just reported on s2"
-  assert_matches_origin "$A" s1
+  assert_eq "$(git log --format=%s origin/s2..s2)" "Y from A" "Y replayed on s2, where it was made"
+  assert_matches_origin "$A" s1 s3                          # s3 adopts the remote; the sync cascade brings Y back
   run gh stack sync; assert_status 0; assert_contains "Pushed"
   assert_matches_origin "$A" s1 s2 s3
+  assert_eq "$(git log --format=%s s2..s3)" "s3" "s3 sits on s2, so on Y, after sync"
   [ -f y.txt ] || { echo "y.txt missing from s3 after sync"; return 1; }
 }
 
@@ -249,6 +249,21 @@ test_conflict_mid_stack_keeps_per_branch_decision() {
   pull --continue; assert_status 0; assert_contains "Kept 1 commit(s)"; assert_contains "Done."
   assert_eq "$(git log --format=%s origin/s2..s2)" "Y from A" "Y kept on s2 after --continue"
   assert_matches_origin "$A" s3; on_branch "$A" s3
+}
+
+test_aborted_parent_then_continue_leaves_sync_working() {
+  fixture
+  (cd "$B" && git switch -q s1 && edit_line 10 "amended by B" && git commit -qa --amend --no-edit && git switch -q s3)
+  commit_on "$B" s3 31 "B on s3" "B s3"; sync_on "$B"       # s1's own commit rewritten; s2, s3 restacked on it
+  cd "$A"; pull --rebase; assert_status 1
+  assert_contains "will be kept"; assert_contains "CONFLICT: rebasing s1"
+  git rebase --abort                                       # keep A's s1 as it was, as the CONFLICT message offers
+  pull --continue; assert_status 0; assert_contains "Done."
+  assert_eq "$(git log -1 --format=%s s1)" "s1" "s1 untouched by the abort"
+  run gh stack sync; assert_status 0; assert_contains "Pushed"
+  assert_eq "$(git log --format=%s s1..s3 | tr '\n' ' ')" "B s3 s3 s2 " "the cascade replays only the children onto A's s1"
+  assert_eq "$(git show s3:file.txt | sed -n 10p)" "edited by s1" "A's version of s1 won"
+  assert_matches_origin "$A" s1 s2 s3
 }
 
 test_refuses_dirty_tree() {

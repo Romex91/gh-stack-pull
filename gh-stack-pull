@@ -159,8 +159,26 @@ run_pending() {
 # gh stack sync cascades with `git rebase --onto <parent> <base> <child>`, taking
 # <base> from the per-branch record in .git/gh-stack. Left stale after a pull,
 # that replays commits the child already has, and a conflict among them fails
-# the sync. Point every base at where the child really forks from its parent,
-# which is what sync itself records after a cascade.
+# the sync. Point every base at where the child's own commits start, which is
+# what sync itself records after a cascade.
+#
+# The base of $1, whose parent is $2 and whose recorded base is $3: the most
+# recent of these that is still in $1's history. The recorded base stays right
+# when $1 was not rebased. Where $1 meets the local parent is right when both
+# were rebased. Where $1 meets the remote parent is right when $1 adopted the
+# remote but the parent did not, e.g. after `git rebase --abort` on the parent:
+# the local parent then meets $1 only below the parent's own commits, and a
+# base there makes sync replay the remote's version of those commits onto the
+# local one.
+branch_base() {
+  local child=$1 parent=$2 best= c
+  for c in "$3" "$(git merge-base "$parent" "$child" 2>/dev/null)" "$(git merge-base "refs/remotes/$REMOTE/$parent" "$child" 2>/dev/null)"; do
+    [ -n "$c" ] && git merge-base --is-ancestor "$c" "$child" 2>/dev/null || continue
+    if [ -z "$best" ] || git merge-base --is-ancestor "$best" "$c"; then best=$c; fi
+  done
+  [ -n "$best" ] && echo "$best"
+}
+
 refresh_stack_metadata() {
   local file view trunk names updates parent b sha base
   file=$(git rev-parse --git-path gh-stack)
@@ -169,10 +187,13 @@ refresh_stack_metadata() {
   trunk=$(jq -r '.trunk' <<<"$view")
   mapfile -t names < <(jq -r '.branches[].name' <<<"$view")
   [ ${#names[@]} -gt 0 ] || return 0
+  declare -A recorded=()
+  while read -r b sha; do recorded[$b]=$sha; done < <(jq -r --arg trunk "$trunk" --arg first "${names[0]}" '
+    .stacks[] | select(.trunk.branch == $trunk and any(.branches[]; .branch == $first)) | .branches[] | "\(.branch) \(.base // "")"' "$file")
   parent=$trunk
   updates=$(for b in "${names[@]}"; do
     sha=$(git rev-parse --verify --quiet "refs/heads/$b") || continue
-    base=$(git merge-base "$parent" "$b" 2>/dev/null) || continue
+    base=$(branch_base "$b" "$parent" "${recorded[$b]:-}") || continue
     jq -cn --arg b "$b" --arg head "$sha" --arg base "$base" '{($b): {head: $head, base: $base}}'
     parent=$b
   done | jq -s 'add // {}')
@@ -266,14 +287,18 @@ for b in "${branches[@]}"; do
     echo "  ${C_BOLD}$b${C_RESET}: ${C_YELLOW}diverged (local +$(git rev-list --count "$remote_sha..$local_sha"), $REMOTE +$(git rev-list --count "$local_sha..$remote_sha"))${C_RESET}"
     diverged+=("$b")
     # A commit removed from a lower branch is also missing from every branch
-    # above it. Every such branch must replay without trusting the fork point,
-    # but the commit is reported once, on the lowest branch.
+    # above it. It belongs to the lowest branch: report it there and replay it
+    # there only. The branches above adopt the remote and get it back through
+    # the cascade of the next gh stack sync, in stack order. Replaying it on
+    # every branch would put it above that branch's own commits, and after a
+    # `git rebase --abort` on the lowest branch would raise the same conflict
+    # again on each branch above.
     while IFS= read -r line; do
-      replay_all[$b]=1
       [ -n "${seen[${line%% *}]:-}" ] && continue
       seen[${line%% *}]=1
       echo "    ${C_YELLOW}pushed earlier, content no longer on $REMOTE, will be kept: $line${C_RESET}"
       kept+=("$b: $line")
+      replay_all[$b]=1
     done < <(removed_commits "$b")
   fi
 done
