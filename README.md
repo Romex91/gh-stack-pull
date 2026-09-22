@@ -1,6 +1,6 @@
 # gh stack-pull
 
-Pull-only sync for [gh-stack](https://github.com/github/gh-stack).
+`git pull` for [gh-stack](https://github.com/github/gh-stack).
 
 # The problem
 
