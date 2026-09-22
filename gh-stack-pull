@@ -1,39 +1,41 @@
 #!/usr/bin/env bash
-# gh stack-pull: pull-only sync for gh-stack.
+# gh stack-pull: `git pull` for a gh-stack stack.
 #
-# Makes the local branches of the current stack match their remote versions,
-# then replays any commit that existed only locally on top. Never pushes.
+# Fetches, then brings every branch of the current stack up to date with its
+# remote counterpart. Fast-forwards when it can. When a local branch has
+# diverged from the remote it stops, like `git pull` does, and asks you to
+# rerun with --rebase, which replays the local commits on top of the remote
+# with git's own rebase. Never pushes.
 #
-# This is the "sync from the remote without pushing" that
-# https://github.com/github/gh-stack/issues/516 asks for, plus a
-# `git pull --rebase`-style replay so nothing local is lost. It goes through
-# gh-stack's own commands (unstack --local, checkout) plus plain git, so
-# gh-stack's local state is always written by gh-stack itself.
+# Motivation: https://github.com/github/gh-stack/issues/516. `gh stack sync`
+# always rebases local branches onto their parents and force-pushes, which
+# overwrites a stack that was rewritten on another machine.
 set -euo pipefail
 
 REMOTE=origin
-DISCARD=0
-DRY_RUN=0
+REBASE=0
 
 usage() {
   cat <<'USAGE'
-Usage: gh stack-pull [--remote <name>] [--discard-local] [--dry-run]
+Usage: gh stack-pull [--rebase] [--remote <name>]
 
-Fetch, then make every branch of the current stack match <remote>/<branch>,
-and replay on top any local commit that has no equivalent upstream.
-Use it on a machine whose stack went stale because another machine (or the
-"Rebase stack" button on GitHub) rewrote and force-pushed the branches.
-Nothing is pushed; run `gh stack sync` afterwards to publish replayed commits.
+`git pull` for the whole stack. Fetches, then for each branch of the stack:
 
-  --remote <name>   Remote to pull from (default: origin)
-  --discard-local   Drop local-only commits instead of replaying them
-                    (their hashes are printed so you can cherry-pick later)
-  --dry-run         Show what would change and exit
-  -h, --help        Show this help
+  up to date            nothing
+  behind the remote     fast-forward
+  ahead of the remote   nothing (gh stack sync pushes it)
+  diverged              stop, unless --rebase
 
-A local commit counts as "already upstream" when a remote commit has the same
-patch (git patch-id, ignoring context lines), so a plain rebase with new hashes
-is recognised as no loss. Requires: gh with the gh-stack extension, git, jq.
+  --rebase         Rebase diverged branches onto their remote counterpart
+                   (git rebase --empty=drop). Local commits already present
+                   upstream are dropped; the rest are replayed on top. A
+                   conflict leaves a normal in-progress rebase to finish with
+                   git rebase --continue / --abort.
+  --remote <name>  Remote to pull from (default: origin)
+  -h, --help       Show this help
+
+Nothing is pushed. Run `gh stack sync` afterwards to publish local commits.
+Requires: gh with the gh-stack extension, git, jq.
 USAGE
 }
 
@@ -41,10 +43,9 @@ die() { echo "gh stack-pull: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --rebase) REBASE=1; shift ;;
     --remote) [ $# -ge 2 ] || die "--remote needs a value"; REMOTE=$2; shift 2 ;;
     --remote=*) REMOTE=${1#--remote=}; shift ;;
-    --discard-local) DISCARD=1; shift ;;
-    --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown argument: $1" ;;
   esac
@@ -59,155 +60,80 @@ grep -q '^gh stack\b' <<<"$extensions" || die "the gh-stack extension is not ins
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
 git remote get-url "$REMOTE" >/dev/null 2>&1 || die "no remote named '$REMOTE'"
-
+[ -e "$(git rev-parse --git-path rebase-merge)" ] || [ -e "$(git rev-parse --git-path rebase-apply)" ] && die "a rebase is in progress; finish it first (git rebase --continue / --abort)"
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   die "working tree has uncommitted changes; commit or move them first"
 fi
 
 view=$(gh stack view --json 2>/dev/null) || die "the current branch is not part of a stack (gh stack checkout <stack> first)"
-current=$(jq -r '.currentBranch // empty' <<<"$view")
-# The JSON carries no stack number; the text view starts with "Stack #N".
-# `gh stack checkout` also takes a PR number, which is the fallback.
-number=$(gh stack view 2>/dev/null | sed -n '1s/^Stack #\([0-9][0-9]*\).*/\1/p')
-checkout_id=$number
-[ -n "$checkout_id" ] || checkout_id=$(jq -r '[.branches[] | select(.pr.state == "OPEN") | .pr.number] | first // empty' <<<"$view")
-[ -n "$checkout_id" ] || die "could not identify the stack (no stack number and no open PR in 'gh stack view')"
-label="stack${number:+ #$number}"
+trunk=$(jq -r '.trunk' <<<"$view")
+current=$(git branch --show-current || true)
 mapfile -t branches < <(jq -r '.branches[] | select(.isMerged | not) | .name' <<<"$view")
-[ ${#branches[@]} -gt 0 ] || die "the $label has no unmerged branches"
+branches=("$trunk" "${branches[@]}")
 
 echo "Fetching $REMOTE..."
 git fetch --quiet --prune "$REMOTE"
 
-# Patch ids of every commit in <range>, one "<patch-id> <commit>" per line.
-# -U0 drops context lines, so a commit whose neighbours changed still matches.
-patch_ids() { git log -p -U0 --no-merges --format='commit %H' "$1" | git patch-id --stable; }
-
-stale=()               # branches to re-pull from the remote
-declare -A replay=()   # branch -> space-separated local-only commits, oldest first
-missing=()             # branches with no remote counterpart
-
+ff=()        # branches to fast-forward
+diverged=()  # branches whose local and remote tips have both moved
 for b in "${branches[@]}"; do
-  local_sha=$(git rev-parse --verify --quiet "refs/heads/$b") || { echo "  $b: no local branch, will be pulled"; stale+=("$b"); continue; }
-  remote_sha=$(git rev-parse --verify --quiet "refs/remotes/$REMOTE/$b") || { missing+=("$b"); continue; }
+  local_sha=$(git rev-parse --verify --quiet "refs/heads/$b") || { echo "  $b: no local branch, skipped"; continue; }
+  remote_sha=$(git rev-parse --verify --quiet "refs/remotes/$REMOTE/$b") || { echo "  $b: not on $REMOTE, skipped"; continue; }
   if [ "$local_sha" = "$remote_sha" ]; then
     echo "  $b: up to date"
-    continue
-  fi
-  if git merge-base --is-ancestor "$local_sha" "$remote_sha"; then
-    echo "  $b: behind, will fast-forward ${local_sha:0:7} -> ${remote_sha:0:7}"
-    stale+=("$b")
-    continue
-  fi
-  if git merge-base --is-ancestor "$remote_sha" "$local_sha"; then
-    echo "  $b: ahead of $REMOTE by $(git rev-list --count "$remote_sha..$local_sha"), nothing to pull (gh stack sync will push it)"
-    continue
-  fi
-  stale+=("$b")
-  base=$(git merge-base "$local_sha" "$remote_sha")
-  remote_ids=$(patch_ids "$base..$remote_sha" | cut -d' ' -f1 | sort -u)
-  declare -A upstream_equiv=()
-  while read -r pid sha; do
-    [ -n "$pid" ] || continue
-    grep -qx "$pid" <<<"$remote_ids" && upstream_equiv[$sha]=1
-  done < <(patch_ids "$base..$local_sha")
-  only_local=()
-  for sha in $(git rev-list --reverse --no-merges "$base..$local_sha"); do
-    [ -n "${upstream_equiv[$sha]:-}" ] || only_local+=("$sha")
-  done
-  if [ ${#only_local[@]} -eq 0 ]; then
-    echo "  $b: rewritten upstream, every local commit has an equivalent, will adopt ${local_sha:0:7} -> ${remote_sha:0:7}"
+  elif git merge-base --is-ancestor "$local_sha" "$remote_sha"; then
+    echo "  $b: behind by $(git rev-list --count "$local_sha..$remote_sha"), fast-forward"
+    ff+=("$b")
+  elif git merge-base --is-ancestor "$remote_sha" "$local_sha"; then
+    echo "  $b: ahead by $(git rev-list --count "$remote_sha..$local_sha"), nothing to pull"
   else
-    if [ $DISCARD -eq 1 ]; then
-      echo "  $b: rewritten upstream, will adopt ${remote_sha:0:7} and DROP ${#only_local[@]} local-only commit(s):"
-    else
-      echo "  $b: rewritten upstream, will adopt ${remote_sha:0:7} and replay ${#only_local[@]} local-only commit(s) on top:"
-    fi
-    for sha in "${only_local[@]}"; do
-      echo "      ${sha:0:7}  $(git log -1 --format=%s "$sha")"
-    done
-    replay[$b]="${only_local[*]}"
+    echo "  $b: diverged (local +$(git rev-list --count "$remote_sha..$local_sha"), $REMOTE +$(git rev-list --count "$local_sha..$remote_sha"))"
+    diverged+=("$b")
   fi
 done
 
-if [ ${#missing[@]} -gt 0 ]; then
-  for b in "${missing[@]}"; do echo "  $b: not on $REMOTE"; done
-  die "some branches have no remote counterpart; push them first (gh stack sync), re-pulling would lose them"
-fi
-
-if [ ${#stale[@]} -eq 0 ]; then
-  echo "The $label already matches $REMOTE."
-  exit 0
-fi
-
-if [ $DRY_RUN -eq 1 ]; then
-  echo "Dry run: would re-pull ${#stale[@]} branch(es) of the $label from $REMOTE."
-  exit 0
-fi
-
-echo "Re-pulling ${#stale[@]} branch(es) of the $label from $REMOTE..."
-# unstack --local without an argument acts on the stack of the current branch,
-# so it runs before we leave that branch.
-gh stack unstack --local >/dev/null
-git switch --quiet --detach
-for b in "${stale[@]}"; do
-  old=$(git rev-parse --verify --quiet "refs/heads/$b") || continue
-  # Keep the old tip reachable so nothing dropped here can be garbage-collected.
-  git update-ref "refs/stack-pull/backup/$b" "$old"
-  git branch --quiet -D "$b"
-  echo "  dropped local $b (was ${old:0:7}, kept at refs/stack-pull/backup/$b)"
-done
-gh stack checkout "$checkout_id" >/dev/null
-
-replayed=0
-failed=()   # "branch<TAB>remaining commits" where a cherry-pick conflicted
-if [ $DISCARD -eq 0 ]; then
-  for b in "${branches[@]}"; do
-    [ -n "${replay[$b]:-}" ] || continue
-    git switch --quiet "$b"
-    pending=(${replay[$b]})
-    while [ ${#pending[@]} -gt 0 ]; do
-      sha=${pending[0]}
-      if git cherry-pick --quiet "$sha" >/dev/null 2>&1; then
-        replayed=$((replayed + 1))
-        echo "  replayed ${sha:0:7} on $b: $(git log -1 --format=%s "$sha")"
-        pending=("${pending[@]:1}")
-      else
-        git cherry-pick --abort >/dev/null 2>&1 || true
-        echo "  CONFLICT replaying ${sha:0:7} on $b; left it and the rest of its commits off the branch" >&2
-        failed+=("$b"$'\t'"${pending[*]}")
-        break
-      fi
-    done
-  done
-fi
-
-if [ -n "$current" ] && git rev-parse --verify --quiet "refs/heads/$current" >/dev/null; then
-  git switch --quiet "$current"
-fi
-
-echo "Done. The $label now matches $REMOTE:"
-for b in "${branches[@]}"; do
-  l=$(git rev-parse --verify --quiet "refs/heads/$b" || echo missing)
-  r=$(git rev-parse --verify --quiet "refs/remotes/$REMOTE/$b" || echo missing)
-  if [ "$l" = "$r" ]; then
-    echo "  $b ${l:0:7}"
-  elif [ -n "${replay[$b]:-}" ]; then
-    echo "  $b ${l:0:7} ($REMOTE ${r:0:7} + replayed local commits)"
-  else
-    echo "  $b local=${l:0:7} $REMOTE=${r:0:7}  <-- still differs"
-  fi
-done
-if [ ${#failed[@]} -gt 0 ]; then
-  echo "Replay these by hand (resolve, git add, git cherry-pick --continue), then 'gh stack sync':" >&2
-  while IFS=$'\t' read -r b shas; do
-    echo "  git switch $b && git cherry-pick $shas" >&2
-  done < <(printf '%s\n' "${failed[@]}")
+if [ ${#diverged[@]} -gt 0 ] && [ $REBASE -eq 0 ]; then
+  echo >&2
+  echo "fatal: ${#diverged[@]} branch(es) have diverged from $REMOTE and cannot be fast-forwarded:" >&2
+  printf '  %s\n' "${diverged[@]}" >&2
+  echo "hint: rerun with --rebase to replay the local commits on top of $REMOTE:" >&2
+  echo "hint:   gh stack-pull --rebase" >&2
   exit 1
 fi
-if [ $replayed -gt 0 ]; then
-  echo "Replayed $replayed local commit(s). Run 'gh stack sync' to push them."
-elif [ $DISCARD -eq 1 ] && [ ${#replay[@]} -gt 0 ]; then
-  echo "Dropped local-only commits (recover with git cherry-pick):"
-  for b in "${!replay[@]}"; do for sha in ${replay[$b]}; do echo "  $b  $sha  $(git log -1 --format=%s "$sha")"; done; done
+
+if [ ${#ff[@]} -eq 0 ] && [ ${#diverged[@]} -eq 0 ]; then
+  echo "Already up to date."
+  exit 0
 fi
+
+for b in "${ff[@]}"; do
+  if [ "$b" = "$current" ]; then
+    git merge --quiet --ff-only "refs/remotes/$REMOTE/$b"
+  else
+    # A fetch from the repository itself is git's fast-forward-only ref update.
+    git fetch --quiet . "refs/remotes/$REMOTE/$b:refs/heads/$b"
+  fi
+  echo "Fast-forwarded $b to $(git rev-parse --short "refs/heads/$b")"
+done
+
+for b in "${diverged[@]}"; do
+  before=$(git rev-parse --short "refs/heads/$b")
+  # --fork-point: like `git pull --rebase`, use the reflog of the remote-tracking
+  # branch to replay only commits made after the last known remote state, so a
+  # branch that was merely rewritten upstream needs no replay at all.
+  if git rebase --quiet --fork-point --empty=drop "refs/remotes/$REMOTE/$b" "$b" >/dev/null 2>&1; then
+    kept=$(git rev-list --count "refs/remotes/$REMOTE/$b..refs/heads/$b")
+    echo "Rebased $b onto $REMOTE ($before -> $(git rev-parse --short "refs/heads/$b"), $kept local commit(s) kept)"
+  else
+    echo >&2
+    echo "CONFLICT: rebasing $b onto $REMOTE/$b stopped." >&2
+    echo "Resolve the conflicts, then 'git rebase --continue' (or 'git rebase --abort')," >&2
+    echo "then rerun 'gh stack-pull --rebase' for the remaining branches." >&2
+    exit 1
+  fi
+done
+
+if [ -n "$current" ] && [ "$(git branch --show-current || true)" != "$current" ]; then
+  git switch --quiet "$current"
+fi
+echo "Done."
