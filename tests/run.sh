@@ -190,6 +190,25 @@ test_clobbered_commit_is_kept_and_pushed_back() {
   assert_matches_origin "$A" s1 s2 s3
 }
 
+test_lost_commit_on_parent_and_child_is_kept_on_both() {
+  fixture
+  add_file_on "$A" s2 y.txt "Y from A"; sync_on "$A"         # Y on s2; A's sync rebases s3 onto it and pushes both
+  local y; y=$(sha "$A" s2)
+  git -C "$A" merge-base --is-ancestor "$y" s3 || { echo "fixture: s3 does not contain Y"; return 1; }
+  add_file_on "$B" s2 v.txt "V from B"; sync_on "$B"         # B never fetched: overwrites Y on s2 and s3 (issue #516)
+  git -C "$A" fetch -q origin
+  assert_eq "$(git -C "$A" branch -r --contains "$y" | wc -l)" 0 "real gh stack sync removed Y from the remote"
+  cd "$A"; pull --rebase; assert_status 0
+  assert_eq "$(grep -c "will be kept: ${y:0:7} Y from A" <<<"$out")" 1 "Y reported once, on the lowest branch"
+  assert_contains "Kept 1 commit(s)"
+  assert_eq "$(git log --format=%s origin/s2..s2)" "Y from A" "Y replayed on s2"
+  assert_eq "$(git log --format=%s origin/s3..s3)" "Y from A" "Y replayed on s3 too, not just reported on s2"
+  assert_matches_origin "$A" s1
+  run gh stack sync; assert_status 0; assert_contains "Pushed"
+  assert_matches_origin "$A" s1 s2 s3
+  [ -f y.txt ] || { echo "y.txt missing from s3 after sync"; return 1; }
+}
+
 test_unpushed_commit_is_replayed_then_synced() {
   fixture
   commit_on "$B" s1 11 "B on s1" "B s1"; sync_on "$B"

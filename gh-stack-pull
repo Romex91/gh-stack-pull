@@ -266,13 +266,14 @@ for b in "${branches[@]}"; do
     echo "  ${C_BOLD}$b${C_RESET}: ${C_YELLOW}diverged (local +$(git rev-list --count "$remote_sha..$local_sha"), $REMOTE +$(git rev-list --count "$local_sha..$remote_sha"))${C_RESET}"
     diverged+=("$b")
     # A commit removed from a lower branch is also missing from every branch
-    # above it; report it once, on the lowest branch.
+    # above it. Every such branch must replay without trusting the fork point,
+    # but the commit is reported once, on the lowest branch.
     while IFS= read -r line; do
+      replay_all[$b]=1
       [ -n "${seen[${line%% *}]:-}" ] && continue
       seen[${line%% *}]=1
       echo "    ${C_YELLOW}pushed earlier, content no longer on $REMOTE, will be kept: $line${C_RESET}"
       kept+=("$b: $line")
-      replay_all[$b]=1
     done < <(removed_commits "$b")
   fi
 done
