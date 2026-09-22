@@ -14,10 +14,14 @@ set -euo pipefail
 
 REMOTE=origin
 REBASE=0
+DROP_REMOVED=0
+KEEP_REMOVED=0
+CONTINUE=0
 
 usage() {
   cat <<'USAGE'
-Usage: gh stack-pull [--rebase] [--remote <name>]
+Usage: gh stack-pull [--rebase [--drop-removed | --keep-removed]] [--remote <name>]
+       gh stack-pull --continue
 
 `git pull` for the whole stack. Fetches, then for each branch of the stack:
 
@@ -29,9 +33,21 @@ Usage: gh stack-pull [--rebase] [--remote <name>]
   --rebase         Rebase diverged branches onto their remote counterpart
                    (git rebase --empty=drop). Local commits already present
                    upstream are dropped; the rest are replayed on top. A
-                   conflict leaves a normal in-progress rebase to finish with
-                   git rebase --continue / --abort.
+                   conflict stops like `git pull --rebase` does: resolve it,
+                   `git add` the files, then run `gh stack-pull --continue`
+                   to finish that branch and go on with the rest.
+                   A local commit that was pushed earlier and has since been
+                   removed on the remote (rewritten there, or overwritten by
+                   a stale `gh stack sync` from another machine) cannot be
+                   told apart from one removed on purpose, so stack-pull
+                   stops and lists such commits unless one of these is given:
+  --drop-removed   Drop them: the remote is right, they were removed on purpose.
+  --keep-removed   Keep them: replay them on top of the remote like any other
+                   local commit (git rebase --no-fork-point).
   --remote <name>  Remote to pull from (default: origin)
+  --continue       After resolving a rebase conflict: finish that branch and
+                   continue with the remaining ones. To skip the conflicted
+                   branch instead, `git rebase --abort` first.
   -h, --help       Show this help
 
 Nothing is pushed. Run `gh stack sync` afterwards to publish local commits.
@@ -56,12 +72,18 @@ die() { echo "${E_RED}gh stack-pull: $*${E_RESET}" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --rebase) REBASE=1; shift ;;
-    --remote) [ $# -ge 2 ] || die "--remote needs a value"; REMOTE=$2; shift 2 ;;
-    --remote=*) REMOTE=${1#--remote=}; shift ;;
+    --drop-removed) DROP_REMOVED=1; shift ;;
+    --keep-removed) KEEP_REMOVED=1; shift ;;
+    --continue) CONTINUE=1; shift ;;
+    --remote) [ $# -ge 2 ] || die "--remote needs a value"; REMOTE=$2; REMOTE_SET=1; shift 2 ;;
+    --remote=*) REMOTE=${1#--remote=}; REMOTE_SET=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown argument: $1" ;;
   esac
 done
+[ $DROP_REMOVED -eq 1 ] && [ $KEEP_REMOVED -eq 1 ] && die "--drop-removed and --keep-removed are mutually exclusive"
+[ $DROP_REMOVED -eq 1 ] || [ $KEEP_REMOVED -eq 1 ] && [ $REBASE -eq 0 ] && die "--drop-removed / --keep-removed need --rebase"
+[ $CONTINUE -eq 1 ] && [ $((REBASE + DROP_REMOVED + KEEP_REMOVED + ${REMOTE_SET:-0})) -gt 0 ] && die "--continue takes no other options; it resumes with the ones given originally"
 
 for tool in gh git jq; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool is required"
@@ -71,8 +93,128 @@ extensions=$(gh extension list 2>/dev/null || true)
 grep -q '^gh stack\b' <<<"$extensions" || die "the gh-stack extension is not installed (gh extension install github/gh-stack)"
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
+
+rebase_in_progress() { [ -e "$(git rev-parse --git-path rebase-merge)" ] || [ -e "$(git rev-parse --git-path rebase-apply)" ]; }
+
+# Where a conflict-stopped run keeps what --continue needs.
+state_file=$(git rev-parse --git-path gh-stack-pull)
+save_state() {  # $1 = branch stopped in conflict, rest = branches still to rebase
+  {
+    echo "remote=$REMOTE"; echo "keep_removed=$KEEP_REMOVED"; echo "start=$current"; echo "conflict=$1"; shift
+    [ $# -gt 0 ] && printf 'pending=%s\n' "$@"
+  } > "$state_file"
+}
+load_state() {
+  pending=()
+  while IFS='=' read -r key value; do
+    case $key in
+      remote) REMOTE=$value ;; keep_removed) KEEP_REMOVED=$value ;; start) current=$value ;;
+      conflict) conflict=$value ;; pending) pending+=("$value") ;;
+    esac
+  done < "$state_file"
+}
+
+# Rebase $1 onto its remote counterpart. Returns 1 if the rebase stopped on a conflict.
+rebase_branch() {
+  local b=$1 before local_sha remote_sha fork_point kept err
+  before=$(git rev-parse --short "refs/heads/$b")
+  local_sha=$(git rev-parse "refs/heads/$b")
+  remote_sha=$(git rev-parse "refs/remotes/$REMOTE/$b")
+  # Leave the remote tip in the branch's own reflog. gh stack sync finds a
+  # child's old base through the parent's reflog (merge-base --fork-point),
+  # and a rebase records only its end result there.
+  git update-ref -m "gh stack-pull: pull $REMOTE/$b" "refs/heads/$b" "$remote_sha" "$local_sha"
+  git update-ref -m "gh stack-pull: replay local commits" "refs/heads/$b" "$local_sha" "$remote_sha"
+  # --fork-point: like `git pull --rebase`, use the reflog of the remote-tracking
+  # branch to replay only commits made after the last known remote state, so a
+  # branch that was merely rewritten upstream needs no replay at all.
+  fork_point=--fork-point
+  [ "$KEEP_REMOVED" -eq 1 ] && fork_point=--no-fork-point
+  if err=$(git rebase --quiet "$fork_point" --empty=drop "refs/remotes/$REMOTE/$b" "$b" 2>&1 >/dev/null); then
+    kept=$(git rev-list --count "refs/remotes/$REMOTE/$b..refs/heads/$b")
+    echo "${C_GREEN}Rebased${C_RESET} ${C_BOLD}$b${C_RESET} onto $REMOTE ($before -> $(git rev-parse --short "refs/heads/$b"), ${C_CYAN}$kept local commit(s) kept${C_RESET})"
+    return 0
+  fi
+  rebase_in_progress && return 1
+  die "could not rebase $b onto $REMOTE/$b:"$'\n'"$err"
+}
+
+stop_on_conflict() {  # $1 = branch, rest = branches still to rebase
+  save_state "$@"
+  echo >&2
+  echo "${E_RED}${E_BOLD}CONFLICT:${E_RESET}${E_RED} rebasing $1 onto $REMOTE/$1 stopped.${E_RESET}" >&2
+  echo "${E_YELLOW}Resolve the conflicts, mark them with ${E_BOLD}git add${E_RESET}${E_YELLOW}, then run${E_RESET}" >&2
+  echo "${E_YELLOW}  ${E_BOLD}gh stack-pull --continue${E_RESET}" >&2
+  echo "${E_YELLOW}To leave $1 as it was instead: ${E_BOLD}git rebase --abort${E_RESET}${E_YELLOW}, then the same --continue for the rest.${E_RESET}" >&2
+  exit 1
+}
+
+run_pending() {
+  local b
+  while [ ${#pending[@]} -gt 0 ]; do
+    b=${pending[0]}
+    pending=("${pending[@]:1}")
+    rebase_branch "$b" || stop_on_conflict "$b" "${pending[@]}"
+  done
+}
+
+# gh stack sync cascades with `git rebase --onto <parent> <base> <child>`, taking
+# <base> from the per-branch record in .git/gh-stack. Left stale after a pull,
+# that replays commits the child already has, and a conflict among them fails
+# the sync. Point every base at where the child really forks from its parent,
+# which is what sync itself records after a cascade.
+refresh_stack_metadata() {
+  local file view trunk names updates parent b sha base
+  file=$(git rev-parse --git-path gh-stack)
+  [ -f "$file" ] || return 0
+  view=$(gh stack view --json 2>/dev/null) || return 0
+  trunk=$(jq -r '.trunk' <<<"$view")
+  mapfile -t names < <(jq -r '.branches[].name' <<<"$view")
+  [ ${#names[@]} -gt 0 ] || return 0
+  parent=$trunk
+  updates=$(for b in "${names[@]}"; do
+    sha=$(git rev-parse --verify --quiet "refs/heads/$b") || continue
+    base=$(git merge-base "$parent" "$b" 2>/dev/null) || continue
+    jq -cn --arg b "$b" --arg head "$sha" --arg base "$base" '{($b): {head: $head, base: $base}}'
+    parent=$b
+  done | jq -s 'add // {}')
+  jq --arg trunk "$trunk" --arg trunk_head "$(git rev-parse "refs/heads/$trunk")" --arg first "${names[0]}" --argjson u "$updates" '
+    (.stacks[] | select(.trunk.branch == $trunk and any(.branches[]; .branch == $first))) |= (
+      .trunk.head = $trunk_head
+      | .branches |= map(if $u[.branch] then .head = $u[.branch].head | .base = $u[.branch].base else . end))
+  ' "$file" > "$file.stack-pull" && mv "$file.stack-pull" "$file"
+}
+
+finish() {
+  rm -f "$state_file"
+  if [ -n "$current" ] && [ "$(git branch --show-current || true)" != "$current" ]; then
+    git switch --quiet "$current"
+  fi
+  refresh_stack_metadata
+  echo "${C_GREEN}${C_BOLD}Done.${C_RESET}"
+}
+
+if [ $CONTINUE -eq 1 ]; then
+  [ -f "$state_file" ] || die "nothing to continue: no gh stack-pull run was stopped by a conflict"
+  load_state
+  if rebase_in_progress; then
+    if ! git rebase --continue; then
+      echo "${E_YELLOW}hint: once the conflicts are resolved and added, run ${E_BOLD}gh stack-pull --continue${E_RESET}${E_YELLOW} again.${E_RESET}" >&2
+      exit 1
+    fi
+    echo "${C_GREEN}Rebased${C_RESET} ${C_BOLD}$conflict${C_RESET} onto $REMOTE"
+  fi
+  run_pending
+  finish
+  exit 0
+fi
+
 git remote get-url "$REMOTE" >/dev/null 2>&1 || die "no remote named '$REMOTE'"
-[ -e "$(git rev-parse --git-path rebase-merge)" ] || [ -e "$(git rev-parse --git-path rebase-apply)" ] && die "a rebase is in progress; finish it first (git rebase --continue / --abort)"
+if [ -f "$state_file" ]; then
+  rebase_in_progress && die "a gh stack-pull rebase stopped on a conflict; resolve it and run gh stack-pull --continue (or git rebase --abort)"
+  rm -f "$state_file"
+fi
+rebase_in_progress && die "a rebase is in progress; finish it first (git rebase --continue / --abort)"
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   die "working tree has uncommitted changes; commit or move them first"
 fi
@@ -86,8 +228,20 @@ branches=("$trunk" "${branches[@]}")
 echo "${C_DIM}Fetching $REMOTE...${C_RESET}"
 git fetch --quiet --prune "$REMOTE"
 
+# Local commits of $1 that a fork-point rebase would drop: they sit between the
+# fork point (the last remote state this branch was built on) and the merge
+# base, and their content is no longer anywhere on the remote branch.
+removed_commits() {
+  local fp
+  fp=$(git merge-base --fork-point "refs/remotes/$REMOTE/$1" "$1" 2>/dev/null) || return 0
+  git cherry "refs/remotes/$REMOTE/$1" "$fp" | sed -n 's/^+ //p' \
+    | xargs -r git log --no-walk --format='%h %s'
+}
+
 ff=()        # branches to fast-forward
 diverged=()  # branches whose local and remote tips have both moved
+removed=()   # "branch: sha subject" lines for commits that --rebase would drop
+declare -A seen
 for b in "${branches[@]}"; do
   local_sha=$(git rev-parse --verify --quiet "refs/heads/$b") || { echo "  ${C_DIM}$b: no local branch, skipped${C_RESET}"; continue; }
   remote_sha=$(git rev-parse --verify --quiet "refs/remotes/$REMOTE/$b") || { echo "  ${C_DIM}$b: not on $REMOTE, skipped${C_RESET}"; continue; }
@@ -101,8 +255,27 @@ for b in "${branches[@]}"; do
   else
     echo "  ${C_BOLD}$b${C_RESET}: ${C_YELLOW}diverged (local +$(git rev-list --count "$remote_sha..$local_sha"), $REMOTE +$(git rev-list --count "$local_sha..$remote_sha"))${C_RESET}"
     diverged+=("$b")
+    # A commit removed from a lower branch is also missing from every branch
+    # above it; report it once, on the lowest branch.
+    while IFS= read -r line; do
+      [ -n "${seen[${line%% *}]:-}" ] && continue
+      seen[${line%% *}]=1
+      echo "    ${C_YELLOW}pushed earlier, since removed on $REMOTE: $line${C_RESET}"
+      removed+=("$b: $line")
+    done < <(removed_commits "$b")
   fi
 done
+
+if [ $REBASE -eq 1 ] && [ ${#removed[@]} -gt 0 ] && [ $DROP_REMOVED -eq 0 ] && [ $KEEP_REMOVED -eq 0 ]; then
+  echo >&2
+  echo "${E_RED}${E_BOLD}fatal:${E_RESET}${E_RED} ${#removed[@]} local commit(s) were pushed earlier and have since been removed on $REMOTE:${E_RESET}" >&2
+  printf '  %s\n' "${removed[@]}" >&2
+  echo "${E_YELLOW}hint: a rebase would drop them. If they were removed on purpose (rewritten on another machine):${E_RESET}" >&2
+  echo "${E_YELLOW}hint:   ${E_BOLD}gh stack-pull --rebase --drop-removed${E_RESET}" >&2
+  echo "${E_YELLOW}hint: if not (a stale gh stack sync overwrote them), keep them and replay on top of $REMOTE:${E_RESET}" >&2
+  echo "${E_YELLOW}hint:   ${E_BOLD}gh stack-pull --rebase --keep-removed${E_RESET}" >&2
+  exit 1
+fi
 
 if [ ${#diverged[@]} -gt 0 ] && [ $REBASE -eq 0 ]; then
   echo >&2
@@ -128,24 +301,6 @@ for b in "${ff[@]}"; do
   echo "${C_GREEN}Fast-forwarded${C_RESET} ${C_BOLD}$b${C_RESET} to $(git rev-parse --short "refs/heads/$b")"
 done
 
-for b in "${diverged[@]}"; do
-  before=$(git rev-parse --short "refs/heads/$b")
-  # --fork-point: like `git pull --rebase`, use the reflog of the remote-tracking
-  # branch to replay only commits made after the last known remote state, so a
-  # branch that was merely rewritten upstream needs no replay at all.
-  if git rebase --quiet --fork-point --empty=drop "refs/remotes/$REMOTE/$b" "$b" >/dev/null 2>&1; then
-    kept=$(git rev-list --count "refs/remotes/$REMOTE/$b..refs/heads/$b")
-    echo "${C_GREEN}Rebased${C_RESET} ${C_BOLD}$b${C_RESET} onto $REMOTE ($before -> $(git rev-parse --short "refs/heads/$b"), ${C_CYAN}$kept local commit(s) kept${C_RESET})"
-  else
-    echo >&2
-    echo "${E_RED}${E_BOLD}CONFLICT:${E_RESET}${E_RED} rebasing $b onto $REMOTE/$b stopped.${E_RESET}" >&2
-    echo "${E_YELLOW}Resolve the conflicts, then ${E_BOLD}git rebase --continue${E_RESET}${E_YELLOW} (or ${E_BOLD}git rebase --abort${E_RESET}${E_YELLOW}),${E_RESET}" >&2
-    echo "${E_YELLOW}then rerun ${E_BOLD}gh stack-pull --rebase${E_RESET}${E_YELLOW} for the remaining branches.${E_RESET}" >&2
-    exit 1
-  fi
-done
-
-if [ -n "$current" ] && [ "$(git branch --show-current || true)" != "$current" ]; then
-  git switch --quiet "$current"
-fi
-echo "${C_GREEN}${C_BOLD}Done.${C_RESET}"
+pending=("${diverged[@]}")
+run_pending
+finish
