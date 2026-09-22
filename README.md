@@ -25,5 +25,4 @@ Requires `gh` with the `gh-stack` extension, `git`, and `jq`.
 
 ## Working from two machines
 
-Start every session with `gh stack-pull`, end it with `gh stack sync`. Never
-leave unpushed commits on a machine you are walking away from.
+Start every session with `gh stack-pull`, end it with `gh stack sync`. Unpushed commits are fine: the next `gh stack-pull` on that machine adopts whatever the other machine pushed and replays them on top.
