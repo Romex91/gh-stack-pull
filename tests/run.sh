@@ -313,6 +313,88 @@ test_lost_commit_is_kept_without_replaying_its_rewritten_neighbours() {
   assert_matches_origin "$A" "$DEFAULT" s2 s3
 }
 
+# A lower branch of more than one commit, squash-merged on GitHub. Its content is
+# on the remote, but as a single commit with a single patch id, so none of the
+# originals matches any more. They must not be reported as lost and replayed:
+# every branch above already carries that content through the merged trunk.
+test_squash_merged_branch_is_not_replayed() {
+  fixture
+  # s1 becomes a three-commit PR: its own line, a paragraph inserted around it,
+  # then a reword of that line, so no single commit's diff survives the squash.
+  (cd "$A" && git switch -q s1 \
+    && sed -i -e '10i\para above s1' -e '12i\para below s1' file.txt && git commit -qam "s1 paragraphs" \
+    && edit_line 11 "reworded by s1" && git commit -qam "s1 reword" && git switch -q -)
+  local tip; tip=$(sha "$A" s1)
+  sync_on "$A"                                             # s2 and s3 restacked on them, everything pushed
+  (cd "$A" && gh stack submit --auto >/dev/null 2>&1) || { echo "gh stack submit failed"; return 1; }
+  rm -rf "$B"; cp -a "$A" "$B"                             # B starts from the same, up-to-date state
+  local n; n=$(gh pr list -R "$REPO" --head s1 --state open --json number --jq '.[0].number')
+  [ -n "$n" ] || { echo "no open PR for s1"; return 1; }
+  gh pr ready -R "$REPO" "$n" >/dev/null 2>&1 || true      # in case submit made drafts
+  (cd "$A" && gh stack merge "$n" --yes --squash >/dev/null 2>&1) || { echo "squash merge of s1 failed"; return 1; }
+  # B adopts the merged trunk and restacks the rest of the stack on it.
+  (cd "$B" && git fetch -q origin && git switch -q "$DEFAULT" && git merge -q --ff-only "origin/$DEFAULT" && git switch -q s3)
+  sync_on "$B"
+  # A never fetched: its s2 and s3 still carry s1's original commits.
+  git -C "$A" merge-base --is-ancestor "$tip" s3 || { echo "fixture: s3 lost s1's commits"; return 1; }
+  cd "$A"; pull --rebase; assert_status 0
+  assert_lacks "will be kept"; assert_lacks "Kept"; assert_lacks "CONFLICT"
+  assert_eq "$(git show s2:file.txt | grep -c 'para above s1')" 1 "s1's paragraph is on s2 exactly once"
+  assert_eq "$(git show s2:file.txt | grep -c 'reworded by s1')" 1 "s1's reworded line is on s2 exactly once"
+  assert_matches_origin "$A" "$DEFAULT" s2 s3
+}
+
+test_replay_preserves_commits_with_abbreviated_commands() {
+  fixture
+  add_file_on "$A" s3 tooltip.txt "add tooltip"
+  (cd "$A" && git push -q origin s3)
+  local tooltip; tooltip=$(sha "$A" s3)
+  add_file_on "$A" s3 local.txt "unpushed local work"
+
+  # B never fetched the tooltip. Its own commit on s3 keeps sync from adopting
+  # the remote s3, and its commit on s2 makes the cascade rewrite s3, which
+  # sync then force-pushes over the tooltip.
+  commit_on "$B" s2 21 "B on s2" "B s2"; add_file_on "$B" s3 remote.txt "remote work"; sync_on "$B"
+  git -C "$A" fetch -q origin
+  assert_eq "$(git -C "$A" branch -r --contains "$tooltip" | wc -l)" 0 "tooltip overwritten remotely"
+
+  cd "$A"
+  git config --local rebase.abbreviateCommands true
+  pull --rebase; assert_status 0
+
+  # Check history and contents: the buggy version exits 0 and claims success.
+  assert_eq "$(git log --reverse --format=%s origin/s3..s3)" $'add tooltip\nunpushed local work' "both local commits preserved"
+  assert_eq "$(git show s3:tooltip.txt)" "tooltip.txt" "lost tooltip recovered"
+  assert_eq "$(git show s3:local.txt)" "local.txt" "unpushed work preserved"
+  assert_eq "$(git show s3:remote.txt)" "remote.txt" "remote work preserved"
+  git merge-base --is-ancestor origin/s3 s3
+  on_branch "$A" s3
+  ! rebasing "$A"
+}
+
+test_replay_works_from_subdirectory() {
+  fixture
+  add_file_on "$A" s3 tooltip.txt "add tooltip"
+  (cd "$A" && git push -q origin s3)
+  local tooltip; tooltip=$(sha "$A" s3)
+  commit_on "$B" s2 21 "B on s2" "B s2"; add_file_on "$B" s3 remote.txt "remote work"; sync_on "$B"   # as above
+  git -C "$A" fetch -q origin
+  assert_eq "$(git -C "$A" branch -r --contains "$tooltip" | wc -l)" 0 "tooltip overwritten remotely"
+
+  # Isolate path handling from the abbreviated-command regression.
+  git -C "$A" config --local rebase.abbreviateCommands false
+  mkdir -p "$A/src/nested"
+  cd "$A/src/nested"
+  pull --rebase; assert_status 0
+
+  assert_eq "$(git log --format=%s origin/s3..s3)" "add tooltip" "tooltip replayed from a subdirectory"
+  assert_eq "$(git show s3:tooltip.txt)" "tooltip.txt" "lost tooltip recovered"
+  assert_eq "$(git show s3:remote.txt)" "remote.txt" "remote work preserved"
+  git merge-base --is-ancestor origin/s3 s3
+  on_branch "$A" s3
+  ! rebasing "$A"
+}
+
 test_refuses_dirty_tree() {
   fixture; cd "$A"; echo dirty >> file.txt
   pull; assert_status 1; assert_contains "uncommitted changes"

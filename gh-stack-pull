@@ -90,19 +90,24 @@ declare -A wanted=()       # for those: the commits to replay, space-separated f
 
 rebase_in_progress() { [ -e "$(git rev-parse --git-path rebase-merge)" ] || [ -e "$(git rev-parse --git-path rebase-apply)" ]; }
 
+# Absolute: git runs the sequence editor from the top-level directory, and the
+# user may run --continue from another one.
+git_dir=$(git rev-parse --absolute-git-dir)
 # Where a conflict-stopped run keeps what --continue needs.
-state_file=$(git rev-parse --git-path gh-stack-pull)
+state_file=$git_dir/gh-stack-pull
 
 # The sequence editor for a replay: keeps only the picks named in $WANTED
 # (full commit ids, space-separated). Git has already dropped picks whose
 # patch is on the remote branch; if nothing is left, "noop" makes the branch
 # the remote branch. Deleting every line would abort the rebase instead.
-todo_filter=$(git rev-parse --git-path gh-stack-pull-todo-filter)
+# "p" is the pick command under rebase.abbreviateCommands, which the rebase
+# turns off anyway.
+todo_filter=$git_dir/gh-stack-pull-todo-filter
 cat > "$todo_filter" <<'FILTER'
 #!/usr/bin/env bash
 awk '
   BEGIN { n = split(ENVIRON["WANTED"], w, " "); for (i = 1; i <= n; i++) wanted[w[i]] = 1 }
-  /^pick / && ($2 in wanted) { print; kept++; next }
+  /^(pick|p) / && ($2 in wanted) { print; kept++; next }
   /^#/ { print; next }
   END { if (!kept) print "noop" }
 ' "$1" > "$1.filtered" && mv "$1.filtered" "$1"
@@ -152,7 +157,7 @@ rebase_branch() {
   # rewritten upstream is replayed and conflicts.
   if [ -n "${replay_all[$b]:-}" ]; then
     err=$(WANTED=${wanted[$b]} GIT_SEQUENCE_EDITOR=$todo_filter \
-      git -c core.abbrev=no rebase --interactive --quiet --empty=drop --onto "refs/remotes/$REMOTE/$b" "$(git merge-base "refs/remotes/$REMOTE/$b" "$b")" "$b" 2>&1 >/dev/null) && ok=1 || ok=0
+      git -c core.abbrev=no -c rebase.abbreviateCommands=false rebase --interactive --quiet --empty=drop --onto "refs/remotes/$REMOTE/$b" "$(git merge-base "refs/remotes/$REMOTE/$b" "$b")" "$b" 2>&1 >/dev/null) && ok=1 || ok=0
   else
     err=$(git rebase --quiet --empty=drop --fork-point "refs/remotes/$REMOTE/$b" "$b" 2>&1 >/dev/null) && ok=1 || ok=0
   fi
@@ -302,6 +307,12 @@ trunk=$(jq -r '.trunk' <<<"$view")
 current=$(git branch --show-current || true)
 mapfile -t branches < <(jq -r '.branches[] | select(.isMerged | not) | .name' <<<"$view")
 branches=("$trunk" "${branches[@]}")
+# Local tips of the stack's merged branches. Their commits are in the trunk,
+# squashed or not, so they are never lost, whatever their patch ids say.
+merged_tips=()
+while read -r m; do
+  t=$(git rev-parse --verify --quiet "refs/heads/$m") && merged_tips+=("$t")
+done < <(jq -r '.branches[] | select(.isMerged) | .name' <<<"$view")
 
 echo "${C_DIM}Fetching $REMOTE...${C_RESET}"
 git fetch --quiet --prune "$REMOTE"
@@ -323,15 +334,25 @@ removed_commits() {
   done < <(patch_ids "$base..$fp")
 }
 
+# True when $1 is reachable from any of the commits in the rest of the
+# arguments: the pre-pull tip of the branch's parent, and the local tips of
+# the stack's merged branches.
+carried_below() {
+  local sha=$1 t; shift
+  for t in "$@"; do git merge-base --is-ancestor "$sha" "$t" 2>/dev/null && return 0; done
+  return 1
+}
+
 # Commits of $1 (pre-pull tip $2) to replay on top of the remote: the ones
 # listed on stdin, which the remote lost, plus the ones never pushed (above the
-# fork point), minus any that its parent (pre-pull tip $3) also carries. Those
-# the parent replays, or the user skips there, and gh stack sync cascades.
+# fork point), minus any carried by the branches below (tips in the remaining
+# arguments). Those the parent replays, or the user skips there, and gh stack
+# sync cascades; a merged branch's are in the trunk already.
 replay_set() {
-  local b=$1 local_sha=$2 parent_sha=$3 fp sha out=
+  local b=$1 local_sha=$2 fp sha out=; shift 2
   fp=$(git merge-base --fork-point "refs/remotes/$REMOTE/$b" "$b" 2>/dev/null) || fp=$local_sha
   for sha in $(cat) $(git rev-list --reverse "$fp..$local_sha"); do
-    [ -n "$parent_sha" ] && git merge-base --is-ancestor "$sha" "$parent_sha" 2>/dev/null && continue
+    carried_below "$sha" "$@" && continue
     out+="$sha "
   done
   echo "${out% }"
@@ -366,13 +387,15 @@ for b in "${branches[@]}"; do
     while IFS= read -r line; do
       [ -n "${seen[${line%% *}]:-}" ] && continue
       seen[${line%% *}]=1
+      full=$(git rev-parse --verify "${line%% *}^{commit}")
+      carried_below "$full" ${merged_tips[@]+"${merged_tips[@]}"} && continue
       echo "    ${C_YELLOW}pushed earlier, content no longer on $REMOTE, will be kept: $line${C_RESET}"
       kept+=("$b: $line")
-      lost+=("$(git rev-parse --verify "${line%% *}^{commit}")")
+      lost+=("$full")
     done < <(removed_commits "$b")
     if [ ${#lost[@]} -gt 0 ]; then
       replay_all[$b]=1
-      wanted[$b]=$(printf '%s\n' "${lost[@]}" | replay_set "$b" "$local_sha" "$parent_sha")
+      wanted[$b]=$(printf '%s\n' "${lost[@]}" | replay_set "$b" "$local_sha" ${parent_sha:+"$parent_sha"} ${merged_tips[@]+"${merged_tips[@]}"})
     fi
   fi
   parent_sha=$local_sha
