@@ -109,6 +109,7 @@ assert_matches_origin() {                                  # assert_matches_orig
 }
 rebasing() { [ -d "$1/.git/rebase-merge" ] || [ -d "$1/.git/rebase-apply" ]; }
 on_branch() { assert_eq "$(git -C "$1" branch --show-current)" "$2" "current branch in $1"; }
+RESTACK='IMPORTANT!!! Run `gh stack sync` to rebase child branches.'
 
 # ================================================================ tests
 
@@ -124,6 +125,7 @@ test_fast_forward_current_and_other_branch() {
   cd "$A"                                                  # on s3: s3 is the checked-out branch, main is not
   pull; assert_status 0
   assert_contains "Fast-forwarded s3"; assert_contains "Fast-forwarded $DEFAULT"; assert_contains "Done."
+  assert_contains "$RESTACK"                               # the trunk moved under s1
   assert_matches_origin "$A" "$DEFAULT" s1 s2 s3; on_branch "$A" s3
   assert_eq "$(sed -n 35p file.txt)" "s3 tip moved on B" "working tree updated by the fast-forward"
 }
@@ -154,7 +156,7 @@ test_rebase_adopts_rewrite() {
   cd "$A"; pull --rebase; assert_status 0
   assert_contains "Fast-forwarded s1"
   assert_eq "$(grep -c '0 local commit(s) kept' <<<"$out")" 2 "s2 and s3 adopted with no replay"
-  assert_lacks "will be kept"; assert_lacks "CONFLICT"; assert_contains "Done."
+  assert_lacks "will be kept"; assert_lacks "CONFLICT"; assert_contains "Done."; assert_lacks "IMPORTANT"
   assert_matches_origin "$A" s1 s2 s3; on_branch "$A" s3
 }
 
@@ -163,7 +165,7 @@ test_rebase_after_fresher_trunk() {
   commit_on "$B" "$DEFAULT" 1 "trunk moved" "trunk"; (cd "$B" && git push -q origin "$DEFAULT")
   sync_on "$B"                                             # rebases the whole stack onto the new trunk
   cd "$A"; pull --rebase; assert_status 0
-  assert_contains "Fast-forwarded $DEFAULT"; assert_lacks "will be kept"; assert_lacks "CONFLICT"
+  assert_contains "Fast-forwarded $DEFAULT"; assert_lacks "will be kept"; assert_lacks "CONFLICT"; assert_lacks "IMPORTANT"
   assert_matches_origin "$A" "$DEFAULT" s1 s2 s3
 }
 
@@ -183,6 +185,7 @@ test_clobbered_commit_is_kept_and_pushed_back() {
   assert_eq "$(git -C "$A" branch -r --contains "$y" | wc -l)" 0 "real gh stack sync removed Y from the remote"
   cd "$A"; pull --rebase; assert_status 0
   assert_contains "will be kept: ${y:0:7} Y from A"; assert_contains "Kept 1 commit(s)"
+  assert_contains "$RESTACK"                               # s3 adopted the remote and is not on s2's tip
   assert_eq "$(git log --format=%s origin/s2..s2)" "Y from A" "Y replayed on top of the remote"
   assert_eq "$(git log -1 --format=%s origin/s2)" "V from B" "remote tip is B's V"
   assert_matches_origin "$A" s1 s3
@@ -203,6 +206,7 @@ test_lost_commit_on_parent_and_child_is_kept_on_both() {
   assert_contains "Kept 1 commit(s)"
   assert_eq "$(git log --format=%s origin/s2..s2)" "Y from A" "Y replayed on s2, where it was made"
   assert_matches_origin "$A" s1 s3                          # s3 adopts the remote; the sync cascade brings Y back
+  assert_contains "$RESTACK"
   run gh stack sync; assert_status 0; assert_contains "Pushed"
   assert_matches_origin "$A" s1 s2 s3
   assert_eq "$(git log --format=%s s2..s3)" "s3" "s3 sits on s2, so on Y, after sync"
@@ -214,7 +218,7 @@ test_unpushed_commit_is_replayed_then_synced() {
   commit_on "$B" s1 11 "B on s1" "B s1"; sync_on "$B"
   commit_on "$A" s3 36 "A on s3" "A s3"
   cd "$A"; pull --rebase; assert_status 0
-  assert_contains "1 local commit(s) kept"; assert_lacks "will be kept"; assert_lacks "CONFLICT"
+  assert_contains "1 local commit(s) kept"; assert_lacks "will be kept"; assert_lacks "CONFLICT"; assert_lacks "IMPORTANT"
   assert_matches_origin "$A" s1 s2
   assert_eq "$(git log --format=%s origin/s3..s3)" "A s3" "A's commit sits on the rewritten s3"
   run gh stack sync; assert_status 0; assert_contains "Pushed"
@@ -232,7 +236,7 @@ test_conflict_on_last_branch_then_continue() {
   pull --rebase; assert_status 1; assert_contains "resolve it and run gh stack-pull --continue"
   pull --continue; assert_status 1; assert_contains "hint"          # still unresolved
   edit_line 30 "resolved"; git add file.txt
-  pull --continue; assert_status 0; assert_contains "Done."
+  pull --continue; assert_status 0; assert_contains "Done."; assert_lacks "IMPORTANT"
   ! rebasing "$A"; [ ! -f .git/gh-stack-pull ]; on_branch "$A" s3
   assert_eq "$(git log --format=%s origin/s3..s3)" "A s3" "the resolved commit is on top"
 }
@@ -246,7 +250,7 @@ test_conflict_mid_stack_keeps_per_branch_decision() {
   assert_contains "will be kept: ${y:0:7} Y from A"; assert_contains "CONFLICT: rebasing s1"
   grep -qx "replay_all=s2" .git/gh-stack-pull; grep -qx "pending=s2" .git/gh-stack-pull; grep -qx "pending=s3" .git/gh-stack-pull
   edit_line 10 "resolved"; git add file.txt
-  pull --continue; assert_status 0; assert_contains "Kept 1 commit(s)"; assert_contains "Done."
+  pull --continue; assert_status 0; assert_contains "Kept 1 commit(s)"; assert_contains "Done."; assert_contains "$RESTACK"
   assert_eq "$(git log --format=%s origin/s2..s2)" "Y from A" "Y kept on s2 after --continue"
   assert_matches_origin "$A" s3; on_branch "$A" s3
 }
@@ -258,12 +262,31 @@ test_aborted_parent_then_continue_leaves_sync_working() {
   cd "$A"; pull --rebase; assert_status 1
   assert_contains "will be kept"; assert_contains "CONFLICT: rebasing s1"
   git rebase --abort                                       # keep A's s1 as it was, as the CONFLICT message offers
-  pull --continue; assert_status 0; assert_contains "Done."
+  pull --continue; assert_status 0; assert_contains "Done."; assert_contains "$RESTACK"
   assert_eq "$(git log -1 --format=%s s1)" "s1" "s1 untouched by the abort"
   run gh stack sync; assert_status 0; assert_contains "Pushed"
   assert_eq "$(git log --format=%s s1..s3 | tr '\n' ' ')" "B s3 s3 s2 " "the cascade replays only the children onto A's s1"
   assert_eq "$(git show s3:file.txt | sed -n 10p)" "edited by s1" "A's version of s1 won"
   assert_matches_origin "$A" s1 s2 s3
+}
+
+test_skipped_parent_conflict_is_not_repeated_on_child() {
+  fixture
+  commit_on "$A" s1 11 "colour support" "add button colour"
+  commit_on "$A" s2 21 "colourful button on page" "use colourful button"
+  sync_on "$A"                                             # s2 and s3 carry both commits; everything pushed
+  local c1 c2; c1=$(sha "$A" s1); c2=$(sha "$A" s2)
+  commit_on "$B" s1 11 "B's own line 11" "B s1"; sync_on "$B"  # B never fetched: both commits gone from the remote
+  git -C "$A" fetch -q origin
+  assert_eq "$(git -C "$A" branch -r --contains "$c1" | wc -l)" 0 "colour support gone from the remote"
+  cd "$A"; pull --rebase; assert_status 1
+  assert_contains "will be kept: ${c1:0:7} add button colour"; assert_contains "will be kept: ${c2:0:7} use colourful button"
+  assert_contains "CONFLICT: rebasing s1"
+  git rebase --abort                                       # skip colour support on s1, as the message offers
+  pull --continue; assert_status 0                         # the skipped conflict must not come back on s2
+  assert_lacks "CONFLICT"
+  assert_eq "$(git log --format=%s origin/s2..s2)" "use colourful button" "only s2's own commit replayed on s2"
+  assert_matches_origin "$A" s3; assert_contains "$RESTACK"
 }
 
 test_refuses_dirty_tree() {

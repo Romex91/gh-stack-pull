@@ -86,6 +86,7 @@ grep -q '^gh stack\b' <<<"$extensions" || die "the gh-stack extension is not ins
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
 
 declare -A replay_all=()   # branches whose rebase must not trust the fork point
+declare -A boundary=()     # for those: the commit above which their own commits start
 
 rebase_in_progress() { [ -e "$(git rev-parse --git-path rebase-merge)" ] || [ -e "$(git rev-parse --git-path rebase-apply)" ]; }
 
@@ -96,6 +97,7 @@ save_state() {  # $1 = branch stopped in conflict, rest = branches still to reba
     echo "remote=$REMOTE"; echo "start=$current"; echo "conflict=$1"; shift
     for b in "$@"; do echo "pending=$b"; done
     for b in "${!replay_all[@]}"; do echo "replay_all=$b"; done
+    for b in "${!boundary[@]}"; do echo "boundary=$b ${boundary[$b]}"; done
     for b in "${kept[@]}"; do echo "kept=$b"; done
   } > "$state_file"
 }
@@ -105,6 +107,7 @@ load_state() {
     case $key in
       remote) REMOTE=$value ;; start) current=$value ;;
       conflict) conflict=$value ;; pending) pending+=("$value") ;; replay_all) replay_all[$value]=1 ;;
+      boundary) boundary[${value%% *}]=${value#* } ;;
       kept) kept+=("$value") ;;
     esac
   done < "$state_file"
@@ -112,7 +115,7 @@ load_state() {
 
 # Rebase $1 onto its remote counterpart. Returns 1 if the rebase stopped on a conflict.
 rebase_branch() {
-  local b=$1 before local_sha remote_sha fork_point kept err
+  local b=$1 before local_sha remote_sha kept err ok
   before=$(git rev-parse --short "refs/heads/$b")
   local_sha=$(git rev-parse "refs/heads/$b")
   remote_sha=$(git rev-parse "refs/remotes/$REMOTE/$b")
@@ -124,11 +127,16 @@ rebase_branch() {
   # --fork-point: like `git pull --rebase`, use the reflog of the remote-tracking
   # branch to replay only commits made after the last known remote state, so a
   # branch that was merely rewritten upstream needs no replay at all. When that
-  # would drop a commit whose content the remote lost, replay from the merge
-  # base instead; git still skips the commits the remote does have.
-  fork_point=--fork-point
-  [ -n "${replay_all[$b]:-}" ] && fork_point=--no-fork-point
-  if err=$(git rebase --quiet "$fork_point" --empty=drop "refs/remotes/$REMOTE/$b" "$b" 2>&1 >/dev/null); then
+  # would drop a commit whose content the remote lost, replay everything above
+  # the branch's boundary instead: its own commits, not its parent's, which the
+  # parent replays (or the user skipped there) and the next gh stack sync
+  # cascades. Git still skips the commits the remote does have.
+  if [ -n "${replay_all[$b]:-}" ]; then
+    err=$(git rebase --quiet --empty=drop --onto "refs/remotes/$REMOTE/$b" "${boundary[$b]}" "$b" 2>&1 >/dev/null) && ok=1 || ok=0
+  else
+    err=$(git rebase --quiet --empty=drop --fork-point "refs/remotes/$REMOTE/$b" "$b" 2>&1 >/dev/null) && ok=1 || ok=0
+  fi
+  if [ $ok -eq 1 ]; then
     kept=$(git rev-list --count "refs/remotes/$REMOTE/$b..refs/heads/$b")
     echo "${C_GREEN}Rebased${C_RESET} ${C_BOLD}$b${C_RESET} onto $REMOTE ($before -> $(git rev-parse --short "refs/heads/$b"), ${C_CYAN}$kept local commit(s) kept${C_RESET})"
     return 0
@@ -204,6 +212,27 @@ refresh_stack_metadata() {
   ' "$file" > "$file.stack-pull" && mv "$file.stack-pull" "$file"
 }
 
+# True when some branch of the stack no longer has its parent's tip in its
+# history, so the stack needs a cascade (gh stack sync) before it is one line
+# again. A pull leaves it that way when a lower branch kept a commit the
+# remote lost, or was left alone after `git rebase --abort`, while the branches
+# above adopted the remote.
+restack_needed() {
+  local view trunk names parent b
+  view=$(gh stack view --json 2>/dev/null) || return 1
+  trunk=$(jq -r '.trunk' <<<"$view")
+  mapfile -t names < <(jq -r '.branches[] | select(.isMerged | not) | .name' <<<"$view")
+  parent=$trunk
+  for b in "${names[@]}"; do
+    git rev-parse --verify --quiet "refs/heads/$b" >/dev/null || continue
+    if git rev-parse --verify --quiet "refs/heads/$parent" >/dev/null && ! git merge-base --is-ancestor "refs/heads/$parent" "refs/heads/$b"; then
+      return 0
+    fi
+    parent=$b
+  done
+  return 1
+}
+
 finish() {
   rm -f "$state_file"
   if [ -n "$current" ] && [ "$(git branch --show-current || true)" != "$current" ]; then
@@ -215,6 +244,9 @@ finish() {
     printf '  %s\n' "${kept[@]}"
   fi
   echo "${C_GREEN}${C_BOLD}Done.${C_RESET}"
+  if restack_needed; then
+    echo "${C_YELLOW}${C_BOLD}IMPORTANT!!! Run \`gh stack sync\` to rebase child branches.${C_RESET}"
+  fi
 }
 
 kept=()
@@ -269,13 +301,26 @@ removed_commits() {
   done < <(patch_ids "$base..$fp")
 }
 
+# Where the own commits of $1 start: the later of where it meets the remote
+# and where it meets its parent as the parent was before this pull ($2).
+# Everything below is the parent's or already upstream, and is not replayed.
+replay_boundary() {
+  local b=$1 parent_sha=$2 best c
+  best=$(git merge-base "refs/remotes/$REMOTE/$b" "$b")
+  if [ -n "$parent_sha" ] && c=$(git merge-base "$parent_sha" "$b" 2>/dev/null) && git merge-base --is-ancestor "$best" "$c"; then
+    best=$c
+  fi
+  echo "$best"
+}
+
 ff=()        # branches to fast-forward
 diverged=()  # branches whose local and remote tips have both moved
 kept=()      # "branch: sha subject" lines for commits the remote lost that --rebase keeps
 declare -A seen
+parent_sha=  # pre-pull tip of the nearest lower branch that exists locally
 for b in "${branches[@]}"; do
   local_sha=$(git rev-parse --verify --quiet "refs/heads/$b") || { echo "  ${C_DIM}$b: no local branch, skipped${C_RESET}"; continue; }
-  remote_sha=$(git rev-parse --verify --quiet "refs/remotes/$REMOTE/$b") || { echo "  ${C_DIM}$b: not on $REMOTE, skipped${C_RESET}"; continue; }
+  remote_sha=$(git rev-parse --verify --quiet "refs/remotes/$REMOTE/$b") || { echo "  ${C_DIM}$b: not on $REMOTE, skipped${C_RESET}"; parent_sha=$local_sha; continue; }
   if [ "$local_sha" = "$remote_sha" ]; then
     echo "  ${C_DIM}$b: up to date${C_RESET}"
   elif git merge-base --is-ancestor "$local_sha" "$remote_sha"; then
@@ -299,8 +344,10 @@ for b in "${branches[@]}"; do
       echo "    ${C_YELLOW}pushed earlier, content no longer on $REMOTE, will be kept: $line${C_RESET}"
       kept+=("$b: $line")
       replay_all[$b]=1
+      boundary[$b]=$(replay_boundary "$b" "$parent_sha")
     done < <(removed_commits "$b")
   fi
+  parent_sha=$local_sha
 done
 
 if [ ${#diverged[@]} -gt 0 ] && [ $REBASE -eq 0 ]; then
