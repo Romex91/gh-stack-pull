@@ -1,0 +1,28 @@
+name: e2e
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# The testbed is wiped before every test, so two runs must never overlap.
+concurrency:
+  group: testbed
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.TESTBED_TOKEN }}
+      TESTBED_REPO: ${{ vars.TESTBED_REPO }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install gh-stack and let git use the token
+        run: |
+          gh extension install github/gh-stack
+          gh auth setup-git
+          gh config set git_protocol https
+      - name: Run the e2e suite
+        run: tests/run.sh
