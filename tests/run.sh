@@ -289,6 +289,30 @@ test_skipped_parent_conflict_is_not_repeated_on_child() {
   assert_matches_origin "$A" s3; assert_contains "$RESTACK"
 }
 
+test_lost_commit_is_kept_without_replaying_its_rewritten_neighbours() {
+  fixture
+  commit_on "$A" s1 11 "button" "add button"; local bt; bt=$(sha "$A" s1)
+  # Line 13, not 12: git conflicts on changes to adjacent lines, so a tooltip right
+  # under the button could not be replayed over an improved button by anyone.
+  commit_on "$A" s1 13 "tooltip" "add tooltip"; local tt; tt=$(sha "$A" s1)
+  sync_on "$A"                                             # both pushed; s2 and s3 restacked on them
+  # B rewrites s1 from the remote's state: rebased onto a moved trunk (line 9 sits in
+  # the button's diff context), button kept then improved in place, the tooltip lost.
+  (cd "$B" && git fetch -q origin && git switch -q "$DEFAULT" && edit_line 9 "trunk moved" && git commit -qam "trunk" \
+    && git push -q origin "$DEFAULT" && git switch -qC s1 "$DEFAULT" && edit_line 10 "edited by s1" && git commit -qam "s1" \
+    && edit_line 11 "button" && git commit -qam "add button" \
+    && edit_line 11 "button improved" && git commit -qam "improve button" && git switch -q s3)
+  sync_on "$B"
+  git -C "$A" fetch -q origin
+  assert_eq "$(git -C "$A" branch -r --contains "$tt" | wc -l)" 0 "tooltip gone from the remote"
+  cd "$A"; pull --rebase; assert_status 0
+  assert_contains "will be kept: ${tt:0:7} add tooltip"; assert_lacks "will be kept: ${bt:0:7} add button"
+  assert_lacks "CONFLICT"; assert_contains "Kept 1 commit(s)"
+  assert_eq "$(git log --format=%s origin/s1..s1)" "add tooltip" "only the tooltip replayed on s1"
+  assert_eq "$(git show s1:file.txt | sed -n '9p;11p;13p' | tr '\n' '|')" "trunk moved|button improved|tooltip|" "s1 has the improved button and the tooltip"
+  assert_matches_origin "$A" "$DEFAULT" s2 s3
+}
+
 test_refuses_dirty_tree() {
   fixture; cd "$A"; echo dirty >> file.txt
   pull; assert_status 1; assert_contains "uncommitted changes"
