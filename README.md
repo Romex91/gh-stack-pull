@@ -1,11 +1,12 @@
 # gh stack-pull
 
 `git pull` for [gh-stack](https://github.com/github/gh-stack).
+This package exists to ~~fix a bug~~ work-around a feature in `gh stack sync`
 
 # The problem
 
 When editing stacks from two machines, `gh stack sync` drops the updates from remote silently. 
-Worse than that `gh stack` provides no solution. This is absolutely ridiculous. `gh stack sync` should be renamed to `gh stack force-push`
+Worse than that `gh stack` provides no solution . A better name for how `gh stack sync` is currently implemented should be `gh stack force-push`.
 
 [gh-stack issue #516](https://github.com/github/gh-stack/issues/516).
 
