@@ -137,9 +137,10 @@ stack_repo() { git remote get-url "$REMOTE" | sed -E 's#^.*[:/]([^/:]+/[^/]+)$#\
 # Branches that were added to the stack on GitHub (gh stack add + submit on
 # another machine, gh stack link) but are missing from the local record.
 # gh stack sync would pull them itself, except that it refuses when a local
-# branch of that name already exists. Record them in the remote's order,
-# creating the local branch from the remote when there is none, so the pull
-# below treats them like the rest. Exit 0 when something was added.
+# branch of that name already exists. Append them, in the remote's order and
+# after any branch only this machine has (as gh stack sync appends), creating
+# the local branch from the remote when there is none, so the pull below
+# treats them like the rest. Exit 0 when something was added.
 adopt_stack_branches() {
   local file number repo stack missing b parent entry
   file=$(git rev-parse --git-path gh-stack)
@@ -160,9 +161,8 @@ adopt_stack_branches() {
     entry=$(jq -cn --argjson stack "$stack" --arg b "$b" --arg head "$(git rev-parse "refs/heads/$b")" --arg base "$(git merge-base "refs/heads/$b" "refs/remotes/$REMOTE/$parent" 2>/dev/null || git rev-parse "refs/heads/$b")" '
       ($stack.pull_requests[] | select(.head.ref == $b)) as $p
       | { branch: $b, head: $head, base: $base, pullRequest: { number: $p.number, id: $p.node_id, url: $p.html_url } }')
-    jq --argjson number "$number" --argjson stack "$stack" --argjson entry "$entry" '
-      ($stack.pull_requests | map(.head.ref)) as $order
-      | (.stacks[] | select(.number == $number) | .branches) |= (. + [$entry] | sort_by(.branch as $b | $order | index($b) // length))' "$file" > "$file.stack-pull" \
+    jq --argjson number "$number" --argjson entry "$entry" '
+      (.stacks[] | select(.number == $number) | .branches) += [$entry]' "$file" > "$file.stack-pull" \
       && mv "$file.stack-pull" "$file"
     echo "  ${C_BOLD}$b${C_RESET}: added to the stack on $REMOTE, now tracked"
   done

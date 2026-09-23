@@ -171,6 +171,26 @@ test_adopts_branch_added_behind_the_record() {
   run gh stack view --json; assert_status 0; assert_contains '"name": "s5"'
 }
 
+# A branch only this machine has (gh stack add, not pushed yet) while another
+# machine added one to the stack on GitHub. The local branch and its commit
+# stay, the remote one is appended after it, as gh stack sync would do.
+test_local_extra_branch_survives_adoption() {
+  fixture
+  local pr
+  (cd "$B" && gh stack submit --auto >/dev/null 2>&1) || { echo "gh stack submit failed on B"; return 1; }
+  pr=$(gh pr list -R "$REPO" --state open --head s3 --json number --jq '.[0].number'); [ -n "$pr" ] || { echo "no PR for s3"; return 1; }
+  cd "$A"; gh stack checkout "$pr" >/dev/null 2>&1 || { echo "gh stack checkout $pr failed on A"; return 1; }
+  gh stack add s4 >/dev/null 2>&1 && edit_line 36 "edited by s4 on A" && git commit -qam "s4 on A" || { echo "gh stack add s4 failed on A"; return 1; }
+  local s4_tip; s4_tip=$(sha "$A" s4)
+  (cd "$B" && gh stack add s5 >/dev/null 2>&1 && edit_line 37 "edited by s5" && git commit -qam s5 && gh stack submit --auto >/dev/null 2>&1) \
+    || { echo "adding s5 on B failed"; return 1; }
+  pull; assert_status 0
+  assert_contains "s4: not on origin, skipped"; assert_contains "s5: added to the stack on origin, now tracked"
+  assert_eq "$(sha "$A" s4)" "$s4_tip" "s4 untouched"
+  assert_eq "$(jq -r '[.stacks[0].branches[].branch] | join(" ")' .git/gh-stack)" "s1 s2 s3 s4 s5" "record order"
+  assert_matches_origin "$A" s1 s2 s3 s5; on_branch "$A" s4
+}
+
 test_fast_forward_current_and_other_branch() {
   fixture
   commit_on "$B" s3 35 "s3 tip moved on B" "more s3"; (cd "$B" && git push -q origin s3)
