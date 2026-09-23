@@ -325,7 +325,9 @@ git fetch --quiet --prune "$REMOTE"
 # longer anywhere on the remote branch. Patches are compared without context
 # lines (-U0), so a commit whose neighbours were rewritten still counts as
 # present; `git cherry` would report it as gone.
-patch_ids() { git log -p -U0 --no-merges --format='commit %H' "$@" | git patch-id --stable; }
+# --no-color: with colour forced on (color.ui or color.diff "always"), escape
+# codes would hide the diff from git patch-id and nothing would count as lost.
+patch_ids() { git log -p -U0 --no-color --no-merges --format='commit %H' "$@" | git patch-id --stable; }
 removed_commits() {
   local fp base remote_ids pid sha
   fp=$(git merge-base --fork-point "refs/remotes/$REMOTE/$1" "$1" 2>/dev/null) || return 0

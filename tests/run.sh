@@ -458,6 +458,46 @@ test_replay_works_with_spaces_in_repository_path() {
   ! rebasing "$A"
 }
 
+check_replay_with_forced_git_colour() {
+  local setting=$1
+  fixture
+  add_file_on "$A" s3 tooltip.txt "add tooltip"
+  (cd "$A" && git push -q origin s3)
+  local tooltip; tooltip=$(sha "$A" s3)
+  add_file_on "$A" s3 local.txt "unpushed local work"
+
+  # B never fetched the tooltip; a commit on s2 too, so the cascade force-pushes s3.
+  commit_on "$B" s2 21 "B on s2" "B s2"; add_file_on "$B" s3 remote.txt "remote work"; sync_on "$B"
+  git -C "$A" fetch -q origin
+  assert_eq "$(git -C "$A" branch -r --contains "$tooltip" | wc -l)" 0 "tooltip overwritten remotely"
+
+  cd "$A"
+  # Isolate each setting from inherited colour configuration.
+  git config --local color.ui false
+  git config --local color.diff auto
+  git config --local "$setting" always
+
+  pull --rebase; assert_status 0
+
+  # The buggy version reports success but loses the tooltip.
+  assert_eq "$(git show s3:tooltip.txt)" "tooltip.txt" "lost tooltip recovered"
+  assert_eq "$(git show s3:local.txt)" "local.txt" "unpushed work preserved"
+  assert_eq "$(git show s3:remote.txt)" "remote.txt" "remote work preserved"
+  assert_eq "$(git log --no-color --reverse --format=%s origin/s3..s3)" \
+    $'add tooltip\nunpushed local work' "both local commits preserved"
+  git merge-base --is-ancestor origin/s3 s3
+  on_branch "$A" s3
+  ! rebasing "$A"
+}
+
+test_replay_preserves_lost_commit_with_color_ui_always() {
+  check_replay_with_forced_git_colour color.ui
+}
+
+test_replay_preserves_lost_commit_with_color_diff_always() {
+  check_replay_with_forced_git_colour color.diff
+}
+
 test_refuses_dirty_tree() {
   fixture; cd "$A"; echo dirty >> file.txt
   pull; assert_status 1; assert_contains "uncommitted changes"
