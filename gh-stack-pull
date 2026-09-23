@@ -90,6 +90,79 @@ declare -A wanted=()       # for those: the commits to replay, space-separated f
 
 rebase_in_progress() { [ -e "$(git rev-parse --git-path rebase-merge)" ] || [ -e "$(git rev-parse --git-path rebase-apply)" ]; }
 
+# The stack of the current branch, as `gh stack view --json` prints it, with
+# the record's `number` added. gh stack view refuses to choose (exit 6) when
+# the branch is recorded in several local stacks, which earlier gh-stack flows
+# left behind. Then GitHub is asked which open stack the branch's PR is in,
+# and the view is built from the local record with that number.
+# Prints the reason on stderr when there is no stack to work with.
+stack_view() {
+  local out file current repo pr numbers candidates stack
+  if out=$(gh stack view --json 2>&1); then
+    file=$(git rev-parse --git-path gh-stack)
+    jq --slurpfile records "$file" '
+      (.trunk) as $trunk | (.branches[0].name) as $first
+      | .number = ([$records[0].stacks[] | select(.trunk.branch == $trunk and any(.branches[]; .branch == $first)) | .number] | first)' <<<"$out"
+    return 0
+  fi
+  if ! grep -q 'multiple stacks' <<<"$out"; then
+    echo "${E_RED}gh stack-pull: the current branch is not part of a stack (gh stack checkout <stack> first)${E_RESET}" >&2
+    return 1
+  fi
+  file=$(git rev-parse --git-path gh-stack)
+  current=$(git branch --show-current)
+  repo=$(stack_repo)
+  numbers=$(for pr in $(jq -r --arg cur "$current" '[.stacks[].branches[] | select(.branch == $cur) | .pullRequest.number] | unique[]' "$file"); do
+    gh api "repos/$repo/stacks?pull_request=$pr" --jq '.[] | select(.open) | .number' 2>/dev/null
+  done | jq -s 'unique')
+  candidates=$(jq -c --argjson numbers "$numbers" '[.stacks[] | select(.number as $n | $numbers | index($n))]' "$file")
+  if [ "$(jq 'length' <<<"$candidates")" -ne 1 ]; then
+    echo "${E_RED}gh stack-pull: the current branch is recorded in local stacks $(jq -r --arg cur "$current" '[.stacks[] | select(any(.branches[]; .branch == $cur)) | .number] | join(", ")' "$file") and GitHub has it in open stacks $(jq -r 'join(", ")' <<<"$numbers"); drop the stale records with gh stack unstack --local <number>${E_RESET}" >&2
+    return 1
+  fi
+  echo "${E_YELLOW}hint: the current branch is also in local stack(s) $(jq -r --arg cur "$current" --argjson numbers "$numbers" '[.stacks[] | select(any(.branches[]; .branch == $cur) and (.number as $n | $numbers | index($n) | not)) | .number] | join(", ")' "$file"), no longer open on GitHub; drop them with ${E_BOLD}gh stack unstack --local <number>${E_RESET}${E_YELLOW} to stop gh stack asking which one to use.${E_RESET}" >&2
+  stack=$(gh api "repos/$repo/stacks/$(jq '.[0].number' <<<"$candidates")") || return 1
+  jq --arg cur "$current" --argjson stack "$stack" '
+    ($stack.pull_requests | map({(.number | tostring): .}) | add // {}) as $pr
+    | .[0] | { number, trunk: .trunk.branch, currentBranch: $cur,
+        branches: [ .branches[] | ($pr[.pullRequest.number | tostring]) as $p
+          | { name: .branch, base, isCurrent: (.branch == $cur), isMerged: ($p.merged_at != null),
+              pr: { number: .pullRequest.number, url: .pullRequest.url, state: (($p.state // "open") | ascii_upcase) } } ] }' <<<"$candidates"
+}
+
+stack_repo() { jq -r '.repository | sub("^[^:]*:"; "")' "$(git rev-parse --git-path gh-stack)"; }
+
+# Branches that were added to the stack on GitHub (gh stack add + submit on
+# another machine, gh stack link) but are missing from the local record.
+# gh stack sync would pull them itself, except that it refuses when a local
+# branch of that name already exists. Record them in the remote's order,
+# creating the local branch from the remote when there is none, so the pull
+# below treats them like the rest. Exit 0 when something was added.
+adopt_stack_branches() {
+  local file number repo stack missing b parent entry
+  file=$(git rev-parse --git-path gh-stack)
+  number=$(jq -r '.number // empty' <<<"$view"); [ -n "$number" ] || return 1
+  repo=$(stack_repo)
+  stack=$(gh api "repos/$repo/stacks/$number" 2>/dev/null) || return 1
+  mapfile -t missing < <(jq -r --argjson stack "$stack" --argjson number "$number" '
+    [.stacks[] | select(.number == $number) | .branches[].branch] as $known
+    | $stack.pull_requests[] | .head.ref | select(. as $b | $known | index($b) | not)' "$file")
+  [ ${#missing[@]} -gt 0 ] || return 1
+  for b in "${missing[@]}"; do
+    git rev-parse --verify --quiet "refs/remotes/$REMOTE/$b" >/dev/null || continue
+    git rev-parse --verify --quiet "refs/heads/$b" >/dev/null || git branch --quiet --track "$b" "refs/remotes/$REMOTE/$b"
+    parent=$(jq -r --arg b "$b" '.pull_requests[] | select(.head.ref == $b) | .base.ref' <<<"$stack")
+    entry=$(jq -cn --argjson stack "$stack" --arg b "$b" --arg head "$(git rev-parse "refs/heads/$b")" --arg base "$(git merge-base "refs/heads/$b" "refs/remotes/$REMOTE/$parent" 2>/dev/null || git rev-parse "refs/heads/$b")" '
+      ($stack.pull_requests[] | select(.head.ref == $b)) as $p
+      | { branch: $b, head: $head, base: $base, pullRequest: { number: $p.number, id: $p.node_id, url: $p.html_url } }')
+    jq --argjson number "$number" --argjson stack "$stack" --argjson entry "$entry" '
+      ($stack.pull_requests | map(.head.ref)) as $order
+      | (.stacks[] | select(.number == $number) | .branches) |= (. + [$entry] | sort_by(.branch as $b | $order | index($b) // length))' "$file" > "$file.stack-pull" \
+      && mv "$file.stack-pull" "$file"
+    echo "  ${C_BOLD}$b${C_RESET}: added to the stack on $REMOTE, now tracked"
+  done
+}
+
 # Absolute: git runs the sequence editor from the top-level directory, and the
 # user may run --continue from another one.
 git_dir=$(git rev-parse --absolute-git-dir)
@@ -216,16 +289,17 @@ branch_base() {
 }
 
 refresh_stack_metadata() {
-  local file view trunk names updates parent b sha base
+  local file view trunk number names updates parent b sha base
   file=$(git rev-parse --git-path gh-stack)
   [ -f "$file" ] || return 0
-  view=$(gh stack view --json 2>/dev/null) || return 0
+  view=$(stack_view 2>/dev/null) || return 0
   trunk=$(jq -r '.trunk' <<<"$view")
+  number=$(jq -r '.number' <<<"$view")
   mapfile -t names < <(jq -r '.branches[].name' <<<"$view")
   [ ${#names[@]} -gt 0 ] || return 0
   declare -A recorded=()
-  while read -r b sha; do recorded[$b]=$sha; done < <(jq -r --arg trunk "$trunk" --arg first "${names[0]}" '
-    .stacks[] | select(.trunk.branch == $trunk and any(.branches[]; .branch == $first)) | .branches[] | "\(.branch) \(.base // "")"' "$file")
+  while read -r b sha; do recorded[$b]=$sha; done < <(jq -r --argjson number "$number" '
+    .stacks[] | select(.number == $number) | .branches[] | "\(.branch) \(.base // "")"' "$file")
   parent=$trunk
   updates=$(for b in "${names[@]}"; do
     sha=$(git rev-parse --verify --quiet "refs/heads/$b") || continue
@@ -247,7 +321,7 @@ refresh_stack_metadata() {
 # above adopted the remote.
 restack_needed() {
   local view trunk names parent b
-  view=$(gh stack view --json 2>/dev/null) || return 1
+  view=$(stack_view 2>/dev/null) || return 1
   trunk=$(jq -r '.trunk' <<<"$view")
   mapfile -t names < <(jq -r '.branches[] | select(.isMerged | not) | .name' <<<"$view")
   parent=$trunk
@@ -305,9 +379,14 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   die "working tree has uncommitted changes; commit or move them first"
 fi
 
-view=$(gh stack view --json 2>/dev/null) || die "the current branch is not part of a stack (gh stack checkout <stack> first)"
-trunk=$(jq -r '.trunk' <<<"$view")
+view=$(stack_view) || exit 1
 current=$(git branch --show-current || true)
+
+echo "${C_DIM}Fetching $REMOTE...${C_RESET}"
+git fetch --quiet --prune "$REMOTE"
+if adopt_stack_branches; then view=$(stack_view) || exit 1; fi
+
+trunk=$(jq -r '.trunk' <<<"$view")
 mapfile -t branches < <(jq -r '.branches[] | select(.isMerged | not) | .name' <<<"$view")
 branches=("$trunk" "${branches[@]}")
 # Local tips of the stack's merged branches. Their commits are in the trunk,
@@ -316,9 +395,6 @@ merged_tips=()
 while read -r m; do
   t=$(git rev-parse --verify --quiet "refs/heads/$m") && merged_tips+=("$t")
 done < <(jq -r '.branches[] | select(.isMerged) | .name' <<<"$view")
-
-echo "${C_DIM}Fetching $REMOTE...${C_RESET}"
-git fetch --quiet --prune "$REMOTE"
 
 # Local commits of $1 that a fork-point rebase would drop: they were on the
 # remote at the last fetch (before the fork point) and their content is no
@@ -417,6 +493,9 @@ fi
 
 if [ ${#ff[@]} -eq 0 ] && [ ${#diverged[@]} -eq 0 ]; then
   echo "${C_GREEN}Already up to date.${C_RESET}"
+  if restack_needed; then
+    echo "${C_YELLOW}${C_BOLD}IMPORTANT!!! Run \`gh stack sync\` to rebase child branches.${C_RESET}"
+  fi
   exit 0
 fi
 

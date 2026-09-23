@@ -118,6 +118,58 @@ test_up_to_date() {
   pull; assert_status 0; assert_contains "Already up to date."
 }
 
+# A branch recorded in two local stacks. gh-stack v0.1.1 refuses to check out a
+# stack whose composition overlaps one already tracked, but older versions and
+# earlier flows left such records behind (popmenu has fix-scroll and virtuoso in
+# stacks 36067 and 36002). The second record is written into .git/gh-stack the
+# way those flows left it: a stale stack over s2 <- s3 next to the live one. `gh
+# stack view` then refuses to pick one ("belongs to multiple stacks"), and the
+# pull must still work.
+test_branch_in_two_local_stacks() {
+  fixture
+  local pr
+  (cd "$B" && gh stack submit --auto >/dev/null 2>&1) || { echo "gh stack submit failed on B"; return 1; }
+  pr=$(gh pr list -R "$REPO" --state open --head s3 --json number --jq '.[0].number'); [ -n "$pr" ] || { echo "no PR for s3"; return 1; }
+  cd "$A"; gh stack checkout "$pr" >/dev/null 2>&1 || { echo "gh stack checkout $pr failed on A"; return 1; }
+  on_branch "$A" s3
+  jq '.stacks += [(.stacks[0] | .number = 999999 | .branches |= map(select(.branch != "s1")))]' .git/gh-stack > .git/gh-stack.new \
+    && mv .git/gh-stack.new .git/gh-stack
+  assert_eq "$(jq '.stacks | length' .git/gh-stack)" 2 "local stacks recorded"
+  run gh stack view --json; assert_status 6; assert_contains "belongs to multiple stacks"   # the precondition
+  pull; assert_status 0; assert_contains "Already up to date."
+  commit_on "$B" s3 35 "s3 tip moved on B" "more s3"; (cd "$B" && git push -q origin s3)
+  pull; assert_status 0; assert_contains "Fast-forwarded s3"; assert_matches_origin "$A" s1 s2 s3
+}
+
+# A branch added to the stack on GitHub behind the local record's back: `gh
+# stack link` never touches local tracking (that is how popmenu's insta-scroll
+# got stuck), and `gh stack add` + submit on another machine leaves the same
+# state, which is what B does here. gh stack sync would pull the branch down
+# itself, but refuses when a local branch of that name exists ("Cannot pull s4
+# from the remote stack: a local branch with that name already exists"). The
+# pull records it (creating the local branch when there is none) so that sync
+# works again.
+test_adopts_branch_added_behind_the_record() {
+  fixture
+  local pr
+  (cd "$B" && gh stack submit --auto >/dev/null 2>&1) || { echo "gh stack submit failed on B"; return 1; }
+  pr=$(gh pr list -R "$REPO" --state open --head s3 --json number --jq '.[0].number'); [ -n "$pr" ] || { echo "no PR for s3"; return 1; }
+  cd "$A"; gh stack checkout "$pr" >/dev/null 2>&1 || { echo "gh stack checkout $pr failed on A"; return 1; }
+  (cd "$B" && gh stack add s4 >/dev/null 2>&1 && edit_line 36 "edited by s4" && git commit -qam s4 && gh stack submit --auto >/dev/null 2>&1) \
+    || { echo "adding s4 on B failed"; return 1; }
+  git fetch -q origin && git branch -q s4 origin/s4                     # the user already has the branch, as with insta-scroll
+  pull; assert_status 0; assert_contains "s4: added to the stack on origin, now tracked"
+  assert_eq "$(jq -r '.stacks[0].branches[-1].branch' .git/gh-stack)" s4 "s4 recorded last"
+  assert_eq "$(jq -r '.stacks[0].branches[-1].pullRequest.number' .git/gh-stack)" "$(gh pr list -R "$REPO" --state open --head s4 --json number --jq '.[0].number')" "s4 PR recorded"
+  run gh stack view --json; assert_status 0; assert_contains '"name": "s4"'
+  run gh stack sync; assert_status 0; assert_lacks "Cannot pull"
+  (cd "$B" && gh stack add s5 >/dev/null 2>&1 && edit_line 37 "edited by s5" && git commit -qam s5 && gh stack submit --auto >/dev/null 2>&1) \
+    || { echo "adding s5 on B failed"; return 1; }
+  pull; assert_status 0; assert_contains "s5: added to the stack on origin, now tracked"   # no local s5: created from origin
+  assert_matches_origin "$A" s4 s5
+  run gh stack view --json; assert_status 0; assert_contains '"name": "s5"'
+}
+
 test_fast_forward_current_and_other_branch() {
   fixture
   commit_on "$B" s3 35 "s3 tip moved on B" "more s3"; (cd "$B" && git push -q origin s3)
