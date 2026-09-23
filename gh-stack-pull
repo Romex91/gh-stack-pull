@@ -130,7 +130,9 @@ stack_view() {
               pr: { number: .pullRequest.number, url: .pullRequest.url, state: (($p.state // "open") | ascii_upcase) } } ] }' <<<"$candidates"
 }
 
-stack_repo() { jq -r '.repository | sub("^[^:]*:"; "")' "$(git rev-parse --git-path gh-stack)"; }
+# owner/name of $REMOTE. Not the record's `repository` field: gh-stack leaves it
+# empty in some repositories (shaka-perf).
+stack_repo() { git remote get-url "$REMOTE" | sed -E 's#^.*[:/]([^/:]+/[^/]+)$#\1#; s#\.git$##'; }
 
 # Branches that were added to the stack on GitHub (gh stack add + submit on
 # another machine, gh stack link) but are missing from the local record.
@@ -143,7 +145,10 @@ adopt_stack_branches() {
   file=$(git rev-parse --git-path gh-stack)
   number=$(jq -r '.number // empty' <<<"$view"); [ -n "$number" ] || return 1
   repo=$(stack_repo)
-  stack=$(gh api "repos/$repo/stacks/$number" 2>/dev/null) || return 1
+  stack=$(gh api "repos/$repo/stacks/$number" 2>&1) || {
+    echo "${E_YELLOW}warning: could not read stack $number of $repo on GitHub, branches added there are not pulled: ${stack##*$'\n'}${E_RESET}" >&2
+    return 1
+  }
   mapfile -t missing < <(jq -r --argjson stack "$stack" --argjson number "$number" '
     [.stacks[] | select(.number == $number) | .branches[].branch] as $known
     | $stack.pull_requests[] | .head.ref | select(. as $b | $known | index($b) | not)' "$file")

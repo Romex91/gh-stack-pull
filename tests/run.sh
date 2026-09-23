@@ -158,6 +158,7 @@ test_adopts_branch_added_behind_the_record() {
   (cd "$B" && gh stack add s4 >/dev/null 2>&1 && edit_line 36 "edited by s4" && git commit -qam s4 && gh stack submit --auto >/dev/null 2>&1) \
     || { echo "adding s4 on B failed"; return 1; }
   git fetch -q origin && git branch -q s4 origin/s4                     # the user already has the branch, as with insta-scroll
+  jq '.repository = ""' .git/gh-stack > .git/gh-stack.new && mv .git/gh-stack.new .git/gh-stack   # as gh-stack left it in shaka-perf
   pull; assert_status 0; assert_contains "s4: added to the stack on origin, now tracked"
   assert_eq "$(jq -r '.stacks[0].branches[-1].branch' .git/gh-stack)" s4 "s4 recorded last"
   assert_eq "$(jq -r '.stacks[0].branches[-1].pullRequest.number' .git/gh-stack)" "$(gh pr list -R "$REPO" --state open --head s4 --json number --jq '.[0].number')" "s4 PR recorded"
